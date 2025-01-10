@@ -9,6 +9,8 @@ from enum import Enum
 
 from typing import Optional
 
+from abc import abstractmethod, ABC
+
 test_params = ParametersSet(2, [15, 3], [1, 1], [1, 5], 1, 50, 1, 1, 50)
 
 
@@ -27,10 +29,23 @@ class Event:
 
 
 class Simulator:
-
+    # singleton class
     CANCELED_EVENT_TIME = -100
+    _instance = None
+    num_instances = 0
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            Simulator._instance = Simulator()
+        return Simulator._instance
 
     def __init__(self):
+
+        assert (
+            self.__class__.num_instances == 0
+        ), "Simulator class already exists somewhere"
+
         self.current_time = 0.0
         self.event_id_counter = 0
         self.event_queue = PriorityQueue()
@@ -38,12 +53,16 @@ class Simulator:
 
         self.processed_events = 0
 
+        self.__class__.num_instances += 1
+
     def _get_next_id(self):
         new_id = self.event_id_counter
         self.event_id_counter += 1
         return new_id
 
-    def schedule_event(self, time: float, action: Callable[[], None], event_type: EventType) -> int:
+    def schedule_event(
+        self, time: float, action: Callable[[], None], event_type: EventType
+    ) -> int:
         """Schedules an event at a specific simulation time."""
         event_id = self._get_next_id()
         event = Event(time, action, event_type, event_id)
@@ -76,51 +95,62 @@ class Simulator:
         """Returns the current simulation time."""
         return self.current_time
 
-    def setup_simulation(self, finish_time):
-        """Sets stop condition and some params?!"""
-        pass
-
     def stop(self):
         """Stops the simulation."""
         pass
 
 
 class Request:
-    def __init__(self, flow_id: int, arrival_time: float, resource_required: int):
+    def __init__(self, flow_id: int, arrival_time: float, total_size: float):
         """
         Initialize a request.
+
         :param flow_id: ID of the flow generating the request
         :param arrival_time: Time at which the request arrives
         :param resource_required: Amount of network resource required for this request
         """
+        # flow id
         self.flow_id = flow_id
+        # time the request is generated and sent to network
         self.arrival_time = arrival_time
+        # min_resources * service_time_with_min_resources, total request_size
+        self.total_size = total_size
 
-        # min_resources * service_time_with_min_resources
-        self.total_size = size
+        # served request size
         self.served_size = 0
+        # last time current_alloc_resource changed
+        self.last_alloc_time = self.arrival_time
+
+        self.current_alloc_resource = 0
+        self.total_alloc_resources = 0
+
+        self.end_service_time = 0
+
+    def _update_served_size_and_last_alloc_time(self):
+        time = Simulator.get_instance().get_current_time()
+        served_size = (time - self.arrival_time) * self.current_alloc_resource
+        assert served_size >= 0, f"negative {served_size}"
+
+        self.served_size += served_size
+        self.last_alloc_time = time
+
+    def realloc_resources(self, new_alloc_resources) -> float:
+        self._update_served_size_and_last_alloc_time()
+        self.current_alloc_resources = new_alloc_resources
+        left_for_service = self.total_size - self.served_size
+        service_time_left = left_for_service / self.current_alloc_resources
+
+        assert service_time_left >= service_time_left
+        return service_time_left
 
 
-        self.resource_required = resource_required
-        self.start_service_time = None
-        self.completion_time = None
-
-    def set_service_start(self, start_time: float):
-        """Records the time when the request starts service."""
-        self.start_service_time = start_time
-
-    def set_completion_time(self, completion_time: float):
-        """Records the time when the request completes service."""
-        self.completion_time = completion_time
-
-
-class Flow:
+class Flow(ABC):
     def __init__(
         self,
         flow_id: int,
         arrival_rate: float,
         service_rate: float,
-        on_arrival_callback: Optional[Callable[[], None]] = None,
+        on_arrival_callback: Optional[Callable[[Request], None]] = None,
     ):
         """
         Initialize flow parameters and store statistics.
@@ -137,21 +167,36 @@ class Flow:
 
         self.generated_requests = 0
 
-    def set_on_arrival_callback(self, fn: Callable[[], None]):
+    def set_on_arrival_callback(self, fn: Callable[[Request], None]):
         self.on_arrival_callback = fn
-
-    def generate_request(self) -> Request:
-        pass
 
     def generate_next_arrival_time(self) -> float:
         """Generates the time until the next request using exponential distribution."""
         return random.expovariate(self.arrival_rate)  # 1 / (1 / lambda)
 
-    """TBD: logic of recalculation time for data traffic requests"""
+    def generate_request(self):
+        size = self.generate_service_time() * self._get_min_resources()
+        request = Request(
+            flow_id=self.flow_id,
+            arrival_time=Simulator.get_instance().get_current_time(),
+            total_size=size,
+        )
 
-    def generate_service_time(self, resources) -> float:
-        """Generates the service time using exponential distribution."""
-        return random.expovariate(self.service_rate)
+        self.on_arrival_callback(request)
+
+        Simulator.get_instance().schedule_event(
+            time=self.generate_next_arrival_time() + Simulator.get_instance().get_current_time(),
+            action=self.generate_request,
+            event_type=EventType.REQUEST_ARRIVAL,
+        )
+
+    @abstractmethod
+    def _get_min_resources(self) -> int:
+        pass
+
+    @abstractmethod
+    def _generate_service_time(self) -> float:
+        pass
 
 
 class RealTimeFlow(Flow):
@@ -164,6 +209,13 @@ class RealTimeFlow(Flow):
     ):
         super().__init__(flow_id, arrival_rate, service_rate)
         self.fixed_resources = fixed_resource
+
+    def _get_min_resources(self) -> int:
+        return self.fixed_resource
+
+    def _generate_service_time(self) -> float:
+        """Generates the service time using exponential distribution."""
+        return random.expovariate(self.service_rate)
 
 
 class ElasticDataFlow(Flow):
@@ -179,6 +231,14 @@ class ElasticDataFlow(Flow):
         self.min_resources = min_resources
         self.max_resources = max_resources
 
+    def _get_min_resources(self) -> int:
+        return self.min_resources
+
+    def _generate_service_time(self) -> float:
+        pass
+        """Generates the service time using exponential distribution."""
+        return random.expovariate(self.service_rate)
+
 
 class Network:
     def __init__(self, capacity: int):
@@ -187,7 +247,8 @@ class Network:
         :param capacity: Total network resource capacity (V)
         """
         self.capacity = capacity
-        self.active_requests = []  # List to track ongoing requests
+        self.requests_lookup = {}
+        self.flows_lookup = {}
 
     def allocate_resources(self, request: Request):
         """
