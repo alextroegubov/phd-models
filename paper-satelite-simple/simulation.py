@@ -7,8 +7,10 @@ from typing import Callable, List
 import random
 from enum import Enum
 
-from typing import Optional
 
+import numpy as np
+from typing import Optional
+from functools import partial
 from abc import abstractmethod, ABC
 
 test_params = ParametersSet(2, [15, 3], [1, 1], [1, 5], 1, 50, 1, 1, 50)
@@ -101,7 +103,14 @@ class Simulator:
 
 
 class Request:
-    def __init__(self, flow_id: int, arrival_time: float, total_size: float):
+    def __init__(
+        self,
+        request_id: int,
+        flow_id: int,
+        arrival_time: float,
+        total_size: float,
+        min_resources: int,
+    ):
         """
         Initialize a request.
 
@@ -109,12 +118,16 @@ class Request:
         :param arrival_time: Time at which the request arrives
         :param resource_required: Amount of network resource required for this request
         """
+        # request_id
+        self.request_id = request_id
         # flow id
         self.flow_id = flow_id
         # time the request is generated and sent to network
         self.arrival_time = arrival_time
         # min_resources * service_time_with_min_resources, total request_size
         self.total_size = total_size
+        # TBD: remove according to logic?
+        self.min_resources = min_resources
 
         # served request size
         self.served_size = 0
@@ -125,6 +138,7 @@ class Request:
         self.total_alloc_resources = 0
 
         self.end_service_time = 0
+        self.service_event_id = -1
 
     def _update_served_size_and_last_alloc_time(self):
         time = Simulator.get_instance().get_current_time()
@@ -139,8 +153,8 @@ class Request:
         self.current_alloc_resources = new_alloc_resources
         left_for_service = self.total_size - self.served_size
         service_time_left = left_for_service / self.current_alloc_resources
+        assert service_time_left >= 0, f"negative {service_time_left}"
 
-        assert service_time_left >= service_time_left
         return service_time_left
 
 
@@ -180,15 +194,31 @@ class Flow(ABC):
             flow_id=self.flow_id,
             arrival_time=Simulator.get_instance().get_current_time(),
             total_size=size,
+            min_resources=self._get_min_resources(),
         )
 
         self.on_arrival_callback(request)
+        self._schedule_request()
 
+    def _schedule_request(self):
         Simulator.get_instance().schedule_event(
-            time=self.generate_next_arrival_time() + Simulator.get_instance().get_current_time(),
+            time=self.generate_next_arrival_time()
+            + Simulator.get_instance().get_current_time(),
             action=self.generate_request,
             event_type=EventType.REQUEST_ARRIVAL,
         )
+
+    def start_flow(self):
+        self._schedule_request()
+
+    def request_accepted(self):
+        pass
+
+    def request_rejected(self):
+        pass
+
+    def request_serviced(self, req: Request):
+        pass
 
     @abstractmethod
     def _get_min_resources(self) -> int:
@@ -241,37 +271,129 @@ class ElasticDataFlow(Flow):
 
 
 class Network:
-    def __init__(self, capacity: int):
+    def __init__(self, params: ParametersSet):
         """
         Initialize network parameters.
         :param capacity: Total network resource capacity (V)
         """
-        self.capacity = capacity
+        self.params: ParametersSet = params
+        self.capacity = self.params.beam_capacity
         self.requests_lookup = {}
         self.flows_lookup = {}
+        self.total_allocated = 0
 
-    def allocate_resources(self, request: Request):
-        """
-        Allocate network resources to a request.
-        :param request: The request to allocate resources for
-        """
-        if request.resource_required <= self.capacity:
-            self.active_requests.append(request)
-            self.capacity -= request.resource_required
-            return True
-        return False
+    def add_flows(self, n_real_time_flows: int, n_elastic_flows: int):
+        flow_id = 0
 
-    def release_resources(self, request: Request):
-        """
-        Release resources held by a request when it completes service.
-        """
-        if request in self.active_requests:
-            self.active_requests.remove(request)
-            self.capacity += request.resource_required
+        for i in range(n_real_time_flows):
+            flow = RealTimeFlow(
+                flow_id,
+                self.params.real_time_lambdas[i],
+                self.params.real_time_mus[i],
+                self.params.real_time_resources[i],
+            )
+            self.flows_lookup[flow_id] = flow
+            flow_id += 1
 
-    def redistribute_resources(self):
+        for _ in range(n_elastic_flows):
+            flow = ElasticDataFlow(
+                flow_id,
+                self.params.data_lambda,
+                self.params.data_mu,
+                self.params.data_resources_min,
+                self.params.data_resources_max,
+            )
+            self.flows_lookup[flow_id] = flow
+            flow_id += 1
+
+        for _, flow in self.flows_lookup.items():
+            flow.set_on_arrival_callback(self.request_arrival_handler)
+            flow.start_flow()
+
+    def request_arrival_handler(self, request: Request):
+        # check if request can be served
+        min_alloc_resources = 0
+        for _, request in self.requests_lookup.items():
+            min_alloc_resources += request.min_resources
+
+        if request.min_resources + min_alloc_resources <= self.capacity:
+            self.accept_request(request)
+            self.flows_lookup[request.flow_id].request_accepted()
+        else:
+            self.flows_lookup[request.flow_id].request_rejected()
+
+    def accept_request(self, request: Request):
+        its_flow = self.flows_lookup[request.flow_id]
+        self.requests_lookup[request.request_id] = request
+
+        # TBD refactor?
+        if isinstance(its_flow, RealTimeFlow):
+            request.realloc_resources(its_flow.fixed_resources)
+        elif isinstance(its_flow, ElasticDataFlow):
+            pass
+
+        self.redistribute_elastic_resources()
+
+    def redistribute_elastic_resources(self):
         """
         Dynamically adjust resource allocation among requests.
         """
-        # Logic for redistribution goes here (if any)
-        pass
+        total_min_alloc = sum(
+            req.min_resources for req in self.requests_lookup.values()
+        )
+        assert total_min_alloc <= self.capacity
+
+        real_time_requests = [
+            req
+            for req in self.requests_lookup.values()
+            if isinstance(self.flows_lookup[req.flow_id], RealTimeFlow)
+        ]
+        real_time_resources = sum(req.alloc_resources for req in real_time_requests)
+        elastic_data_requests = [
+            req
+            for req in self.requests_lookup.values()
+            if isinstance(self.flows_lookup[req.flow_id], ElasticDataFlow)
+        ]
+        resources_left_for_elastic = self.capacity - real_time_resources
+
+
+        total_allocated = real_time_resources
+
+        round_down_resources = resources_left_for_elastic // len(elastic_data_requests)
+        num_request_with_round_up = resources_left_for_elastic % len(
+            elastic_data_requests
+        )
+        num_request_with_round_down = (
+            len(elastic_data_requests) - num_request_with_round_up
+        )
+
+        assert (
+            resources_left_for_elastic
+            == round_down_resources * num_request_with_round_down
+            + (round_down_resources + 1) * num_request_with_round_up
+        )
+        # allocate resources for requests
+        # TBD: check min and max possible according to flow
+        for req in elastic_data_requests:
+            its_flow = self.flows_lookup[req.flow_id]
+            suggested_resources = round_down_resources + 1 if num_request_with_round_up > 0 else round_down_resources
+            alloc_resources = min(suggested_resources, its_flow.max_resources)
+
+            new_service_time = req.realloc_resources(alloc_resources)
+            total_allocated += alloc_resources
+            Simulator.get_instance().cancel_event(req.service_event_id)
+            Simulator.get_instance().schedule_event(
+                time=Simulator.get_instance().get_current_time() + new_service_time,
+                action=partial(self.service_request, req.request_id),
+            )
+
+
+
+    def request_service_handler(self, req_id: int):
+        request = self.requests_lookup[req_id]
+        request.end_service_time = Simulator.get_instance().get_current_time()
+        request.realloc_resources(0)
+
+        assert np.isclose(request.served_size, request.total_size), f"{request.served_size} != {request.total_size}"
+        self.flows_lookup[request.flow_id].request_serviced(request)
+
