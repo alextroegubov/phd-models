@@ -1,13 +1,14 @@
 """Simulation module for the satellite network model."""
 
+from __future__ import annotations
+from typing import Callable, Optional
+
 import logging
 from queue import PriorityQueue
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import partial
 from abc import abstractmethod, ABC
-
-from typing import Callable, Optional
 
 import random
 import numpy as np
@@ -16,8 +17,9 @@ from utils import ParametersSet
 logger = logging.getLogger(__name__)
 logging.basicConfig(filename="simulation.log", filemode="w", level=logging.DEBUG, encoding="utf-8")
 
-
 test_params = ParametersSet(2, [15, 3], [1, 1], [1, 5], 1, 50, 1, 1, 50)
+
+# class StatsAssistent
 
 
 class EventType(Enum):
@@ -35,13 +37,13 @@ class Event:
 
     :param time: Time at which the event occurs
     :param action: Function to be executed when the event occurs
-    :param event_type: Type of the event
+    :param type: Type of the event
     :param event_id: Unique identifier for the event
     """
 
     time: float
     action: Callable[[], None] = field(compare=False)
-    event_type: EventType = field(compare=False)
+    type: EventType = field(compare=False)
     event_id: int = field(compare=False)
 
 
@@ -58,15 +60,15 @@ class Simulator:
     #     if not hasattr(cls, "_instance"):
     #         cls._instance = super(Simulator, cls).__new__(cls)
     #     return cls._instance
-    _instance = None
+    _instance: Optional[Simulator] = None
     num_instances = 0
 
     @classmethod
-    def get_instance(cls):
+    def get_instance(cls) -> Simulator:
         """Get instance of the simulator or create it if it does not exist."""
         if cls._instance is None:
-            Simulator._instance = Simulator()
-        return Simulator._instance
+            cls._instance = Simulator()
+        return cls._instance
 
     @classmethod
     def schedule_event(cls, time: float, action: Callable[[], None], e_type: EventType) -> int:
@@ -74,21 +76,22 @@ class Simulator:
 
         :param time: Time at which the event occur
         :param action: Function to be executed
-        :param event_type: Type of the event
+        :param e_type: Type of the event
         :return: Unique identifier for the event
         """
         instance = cls.get_instance()
         event_id = instance._get_next_id()
         event = Event(time, action, e_type, event_id)
         instance.event_lookup[event_id] = event
-        instance.event_queue.put(event)
+        instance.event_queue.put(event, block=False)
 
         logger.debug(
-            "%s Event[id=%s, type=%s] scheduled at %s",
+            "%4.5f Event[id=%s, type=%s] scheduled at %4.5f; queue_size=%s",
             instance.get_current_time(),
             event_id,
-            e_type,
+            e_type.name,
             time,
+            instance.event_queue.qsize(),
         )
         return event_id
 
@@ -103,28 +106,36 @@ class Simulator:
         if event is not None:
             # delete from lookuptable
             del instance.event_lookup[event_id]
+            logger.debug(
+                "%4.5f Event[id=%s, type=%s, time=%4.5f] cancelled",
+                instance.get_current_time(),
+                event_id,
+                event.type.name,
+                event.time,
+            )
             # make fields invalid
             event.time = instance.CANCELED_EVENT_TIME
             event.type = EventType.CANCELLED
             event.action = cls.cancelled_event_action
-
-            logger.debug("%s Event[id=%s] cancelled", instance.get_current_time(), event_id)
         else:
-            logger.warning(
-                "%s Event[id=%s] cannot be cancelled", instance.get_current_time(), event_id
-            )
+            logger.warning("%4.5f No Event[id=%s] to cancel", instance.get_current_time(), event_id)
 
     @classmethod
     def run(cls, number_of_events: int):
         """Starts the simulation loop."""
         instance = cls.get_instance()
 
-        while not instance.event_queue.empty() or instance.processed_events < number_of_events:
-            event = instance.event_queue.get()
+        while not instance.event_queue.empty() and instance.processed_events < number_of_events:
+            event = instance.event_queue.get(block=False)
             if event.type is not EventType.CANCELLED:
                 instance.current_time = event.time
                 logger.debug(
-                    "%s Event[id=%s] executed", instance.get_current_time(), event.event_id
+                    "%4.5f Event[id=%s, type=%s, time=%4.5f] executed; queue_size=%s",
+                    instance.get_current_time(),
+                    event.event_id,
+                    event.type.name,
+                    event.time,
+                    instance.event_queue.qsize(),
                 )
                 event.action()
                 instance.processed_events += 1
@@ -153,7 +164,7 @@ class Simulator:
         self.current_time: float = 0.0
 
         self.event_id_counter: int = 0
-        self.event_queue = PriorityQueue()
+        self.event_queue: PriorityQueue[Event] = PriorityQueue()
         self.event_lookup: dict[int, Event] = {}
 
         self.processed_events: int = 0
@@ -195,7 +206,7 @@ class Request:
         self.arrival_time: float = arrival_time
         # TBD: remove according to logic?
         self.min_resources: int = min_resources
-        self.service_event_id = -1
+        self.service_event_id: Optional[int] = None
 
         self.total_size: float = total_size
         self.served_size: float = 0
@@ -204,19 +215,31 @@ class Request:
         self.current_alloc_resource: int = 0
         self.end_service_time: float = 0.0
 
+    def __str__(self) -> str:
+        sep = "\n\t\t"
+        req_str = (
+            f"\n\tRequest[{sep}id={self.request_id}, flow_id={self.flow_id}, "
+            f"event_id={self.service_event_id},"
+            f"{sep}size={self.total_size:2.5f}, served_size={self.served_size:2.5f},"
+            f"{sep}alloc_res={self.current_alloc_resource}\n\t]"
+        )
+        return req_str
+
     def _update_served_size_and_last_alloc_time(self):
         """Updates the served size and last allocation time of the request.
         Does not change the current allocation resources.
         """
-        time = Simulator.get_instance().get_current_time()
-        served_size = (time - self.arrival_time) * self.current_alloc_resource
+        time = Simulator.get_current_time()
+        served_size = (time - self.last_alloc_time) * self.current_alloc_resource
+
+        logger.debug(
+            ("%4.5f " + str(self) + ": updated:  new served_size=%2.5f"),
+            time,
+            self.served_size + served_size,
+        )
+
         self.served_size += served_size
         self.last_alloc_time = time
-
-        if served_size < 0:
-            logger.error(
-                "%s request[id=%s] has negative served size: %s", time, self.request_id, served_size
-            )
 
     def realloc_resources(self, new_alloc_resources: int) -> float:
         """Reallocate resources for the request and return the remaining service time.
@@ -224,18 +247,31 @@ class Request:
         :return: Remaining service time for the request
         """
         self._update_served_size_and_last_alloc_time()
+
+        logger.debug(
+            ("%4.5f " + str(self) + ": update: new alloc_res = %s"),
+            Simulator.get_current_time(),
+            new_alloc_resources,
+        )
+
         self.current_alloc_resource = new_alloc_resources
         service_time_left = (self.total_size - self.served_size) / self.current_alloc_resource
 
         if service_time_left < 0:
             logger.error(
-                "%s request[id=%s] has negative service time left: %s",
+                ("%4.5f " + str(self) + ": negative service time left: %4.5f"),
                 Simulator.get_current_time(),
-                self.request_id,
                 service_time_left,
             )
 
         return service_time_left
+
+    def finish_service(self):
+        """Finish servicing request"""
+        self._update_served_size_and_last_alloc_time()
+        self.current_alloc_resource = 0
+
+        logger.debug(("%4.5f " + str(self) + ": finish service"), Simulator.get_current_time())
 
 
 class Flow(ABC):
@@ -288,16 +324,15 @@ class Flow(ABC):
             min_resources=self._get_min_resources(),
         )
 
-        logger.debug(
-            "%s Request[id=%s, flow_id=%s, size=%s] generated",
-            Simulator.get_current_time(),
-            req.request_id,
-            req.flow_id,
-            req.total_size,
-        )
+        logger.debug(("%4.5f " + str(req) + ": generated"), Simulator.get_current_time())
 
         self.total_gen_requests += 1
-        self.on_arrival_callback(req)
+        if self.on_arrival_callback is not None:
+            self.on_arrival_callback(req)
+        else:
+            pass
+            assert False, "callback not set"
+            # add log that on_arrival_callback not set
         self._schedule_request()
 
     def _schedule_request(self):
@@ -333,7 +368,7 @@ class Flow(ABC):
         service_time = req.end_service_time - req.arrival_time
 
         self.actual_service_time.append(service_time)
-        self.actual_mean_resources.append(req.size / service_time)
+        self.actual_mean_resources.append(req.total_size / service_time)
 
     @abstractmethod
     def _get_min_resources(self) -> int:
@@ -378,6 +413,10 @@ class ElasticDataFlow(Flow):
     ):
         super().__init__(flow_id, arrival_rate, service_rate)
         self.min_resources, self.max_resources = min_max_resources_range
+
+    def get_max_resources(self) -> int:
+        """Return maximum amount of resources to serve the request"""
+        return self.max_resources
 
     def _get_min_resources(self) -> int:
         """Return minimum resources required to serve the request."""
@@ -443,10 +482,14 @@ class Network:
         min_required_resources = sum(req.min_resources for req in self.requests_lookup.values())
         its_flow = self.flows_lookup[new_req.flow_id]
 
+        req_str = f"{Simulator.get_current_time():4.5f} " + str(new_req)
+
         if new_req.min_resources + min_required_resources <= self.capacity:
+            logger.debug(req_str + ": accepted")
             self.accept_request(new_req)
             its_flow.request_accepted()
         else:
+            logger.debug(req_str + ": rejected")
             its_flow.request_rejected()
 
     def accept_request(self, new_req: Request):
@@ -455,16 +498,35 @@ class Network:
         self.requests_lookup[new_req.request_id] = new_req
 
         if isinstance(its_flow, RealTimeFlow):
-            new_req.realloc_resources(its_flow.fixed_resources)
+            service_time = new_req.realloc_resources(its_flow.fixed_resource)
+            # schedule service event
+            event_id = Simulator.schedule_event(
+                time=Simulator.get_current_time() + service_time,
+                action=partial(self.request_service_handler, new_req.request_id),
+                e_type=EventType.REQUEST_SERVICE,
+            )
+            new_req.service_event_id = event_id
 
         self.redistribute_elastic_resources()
+
+    def _log_str_with_distr(self, mark: str = ""):
+        str_start = f"{Simulator.get_current_time():4.5f} Distribution [{mark}]:\n"
+
+        for _, req in self.requests_lookup.items():
+            req_str = (
+                f"\tRequest[id={req.request_id}, flow_id={req.flow_id}, "
+                f"event_id={req.service_event_id}, alloc_res={req.current_alloc_resource}]\n"
+            )
+            str_start += req_str
+
+        return str_start
 
     def redistribute_elastic_resources(self):
         """Dynamically adjust resource allocation among elastic requests."""
         min_required_resources = sum(req.min_resources for req in self.requests_lookup.values())
         if min_required_resources > self.capacity:
             logger.error(
-                "Total required resources exceed capacity: %s > %s",
+                "Redistribution failed: total required resources exceed capacity: %s > %s",
                 min_required_resources,
                 self.capacity,
             )
@@ -480,49 +542,82 @@ class Network:
             if isinstance(self.flows_lookup[req.flow_id], ElasticDataFlow)
         ]
 
-        real_time_resources = sum(req.alloc_resources for req in real_time_requests)
+        logger.debug(
+            "%4.5f Resource distribution: min_required=%s, rt_reqs=%s, ed_reqs=%s",
+            Simulator.get_current_time(),
+            min_required_resources,
+            len(real_time_requests),
+            len(elastic_data_requests),
+        )
+
+        logger.debug(self._log_str_with_distr("old"))
+
+        if len(elastic_data_requests) == 0:
+            return
+
+        real_time_resources = sum(req.current_alloc_resource for req in real_time_requests)
         resources_left_for_elastic = self.capacity - real_time_resources
 
-        already_allocated = real_time_resources
-
         # resources per request rounded down: q
-        round_down_resources = resources_left_for_elastic // len(elastic_data_requests)
+        rfloor_res = resources_left_for_elastic // len(elastic_data_requests)
         # number of requests with (q + 1) resources
-        num_request_with_round_up = resources_left_for_elastic % len(elastic_data_requests)
+        num_req_ceil_res = resources_left_for_elastic % len(elastic_data_requests)
         # number of requests with (q) resources
-        num_request_with_round_down = len(elastic_data_requests) - num_request_with_round_up
+        num_req_floor_res = len(elastic_data_requests) - num_req_ceil_res
 
-        if resources_left_for_elastic != round_down_resources * num_request_with_round_down + (round_down_resources + 1) * num_request_with_round_up:
-            
+        total_distributed = rfloor_res * num_req_floor_res + (rfloor_res + 1) * num_req_ceil_res
 
-        assert (
-            resources_left_for_elastic
-            == round_down_resources * num_request_with_round_down
-            + (round_down_resources + 1) * num_request_with_round_up
-        )
-        # allocate resources for requests
-        # TBD: check min and max possible according to flow
+        if resources_left_for_elastic != total_distributed:
+            logger.error("%4.5f Incorrect distribution", Simulator.get_current_time())
+
+        # TBD: check min according to flow
         for req in elastic_data_requests:
             its_flow = self.flows_lookup[req.flow_id]
-            suggested_resources = (
-                round_down_resources + 1 if num_request_with_round_up > 0 else round_down_resources
-            )
-            alloc_resources = min(suggested_resources, its_flow.max_resources)
+            assert isinstance(its_flow, ElasticDataFlow)
 
+            suggested_resources = rfloor_res + 1 if num_req_ceil_res > 0 else rfloor_res
+            num_req_ceil_res -= 1
+            alloc_resources = min(suggested_resources, its_flow.get_max_resources())
+            # allocate new resources to request
             new_service_time = req.realloc_resources(alloc_resources)
-            already_allocated += alloc_resources
-            Simulator.get_instance().cancel_event(req.service_event_id)
-            Simulator.get_instance().schedule_event(
-                time=Simulator.get_instance().get_current_time() + new_service_time,
+            # cancel previous service event
+            if req.service_event_id is not None:
+                Simulator.cancel_event(req.service_event_id)
+            # schedule new service event
+            event_id = Simulator.schedule_event(
+                time=Simulator.get_current_time() + new_service_time,
                 action=partial(self.request_service_handler, req.request_id),
+                e_type=EventType.REQUEST_SERVICE,
             )
+            req.service_event_id = event_id
+
+        logger.debug(self._log_str_with_distr("new"))
 
     def request_service_handler(self, req_id: int):
-        request = self.requests_lookup[req_id]
-        request.end_service_time = Simulator.get_instance().get_current_time()
-        request.realloc_resources(0)
+        req = self.requests_lookup[req_id]
+        req.end_service_time = Simulator.get_current_time()
+        req.finish_service()
 
-        assert np.isclose(
-            request.served_size, request.total_size
-        ), f"{request.served_size} != {request.total_size}"
-        self.flows_lookup[request.flow_id].request_serviced(request)
+        if not np.isclose(req.served_size, req.total_size):
+            logger.error(
+                "%4.5f Request[id=%s]: served(%2.5f) != total(%2.5f)",
+                Simulator.get_current_time(),
+                req.request_id,
+                req.served_size,
+                req.total_size,
+            )
+
+        self.flows_lookup[req.flow_id].request_serviced(req)
+
+        # delete request
+        del self.requests_lookup[req_id]
+        # update resource distribution
+        self.redistribute_elastic_resources()
+
+
+random.seed(1)
+test_params = ParametersSet(2, [15, 3], [1, 1], [1, 5], 1, 50, 1, 1, 50)
+simulator = Simulator.get_instance()
+network = Network(test_params)
+network.add_flows(2, 1)
+simulator.run(1000)
