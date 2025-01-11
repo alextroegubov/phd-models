@@ -55,7 +55,6 @@ class Simulator:
         """Action placeholder for cancelled events."""
         raise AttributeError("Cancelled event executed")
 
-    CANCELED_EVENT_TIME = -100
     # def __new__(cls):
     #     if not hasattr(cls, "_instance"):
     #         cls._instance = super(Simulator, cls).__new__(cls)
@@ -114,7 +113,6 @@ class Simulator:
                 event.time,
             )
             # make fields invalid
-            event.time = instance.CANCELED_EVENT_TIME
             event.type = EventType.CANCELLED
             event.action = cls.cancelled_event_action
         else:
