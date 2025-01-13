@@ -1,34 +1,29 @@
-from utils import ParametersSet
-import itertools
+from __future__ import annotations
 
+from utils import ParametersSet, Metrics
+import itertools
+import time
 import numpy as np
 
+# all three eqs are ok
 test_params = ParametersSet(2, [15, 3], [1, 1], [1, 5], 1, 50, 1, 1, 50)
 
-# test_params_satelite = ParametersSet(
-#     real_time_flows=2,
-#     real_time_lambdas=[2.5 * 1 / 3, 1 / 15],
-#     real_time_mus=[1 / 3, 1 / 15],
-#     real_time_resources=[1, 4],
-#     data_resources_min=2,
-#     data_resources_max=8,
-#     data_lambda=1 / 20,
-#     data_mu=1 / 20,
-#     beam_capacity=10,
-# )
+# ok
+test_params = ParametersSet(1, [3], [1], [5], 1, 50, 1, 1, 50)
 
-test_params = test_params
+
+test_params = ParametersSet(1, [0.042], [1 / 300], [3], 1, 5, 4.2, 1 / 16, 50)
 
 
 def get_possible_states(parameters: ParametersSet):
     beam_capacity = parameters.beam_capacity
     b_min = parameters.data_resources_min
 
-    max_data_flows = beam_capacity / parameters.data_resources_min
+    max_data_flows = beam_capacity // parameters.data_resources_min
     data_flow_states = np.arange(max_data_flows + 1, dtype=int)
 
     real_time_flows_states = [
-        np.arange(int(beam_capacity / b) + 1, dtype=int) for b in parameters.real_time_resources
+        np.arange(beam_capacity // b + 1, dtype=int) for b in parameters.real_time_resources
     ]
 
     # product of possible values
@@ -48,40 +43,28 @@ class State:
         self.i_vec = i_vec
         self.d = d
 
-    def change_ik(self, k, delta=1):
+    def ik_(self, k, delta=1):
         i_vec = self.i_vec.copy()
         i_vec[k] += delta
 
         return State(i_vec, self.d)
 
-    def change_d(self, delta=1):
+    def d_(self, delta=1):
         return State(self.i_vec, self.d + delta)
 
 
 class Solver:
-    def __init__(self, params: ParametersSet, possible_states, epsilon: float):
+    def __init__(self, params: ParametersSet, possible_states, max_eps: float, max_iter: int):
         self.params: ParametersSet = params
         self.possible_states: list[tuple] = possible_states
-        self.epsilon: float = epsilon
+        self.max_eps: float = max_eps
+        self.max_iter: int = max_iter
 
-        self.prev_states_dct: dict[tuple, float] = {state: 1.0 / 1000 for state in possible_states}
-        self.next_states_dct: dict[tuple, float] = {}
-
-    def calculate_error(self):
-        norm_delta = np.linalg.norm(
-            [
-                self.next_states_dct[s] - self.prev_states_dct[s]
-                for s in self.next_states_dct.keys()
-            ],
-            ord=1,
-        )
-        norm_vect = np.linalg.norm(list(self.prev_states_dct.values()), ord=1)
-        error = norm_delta / norm_vect
-        return error
+        self.states: dict[tuple, float] = {state: 1.0 for state in possible_states}
 
     def solve(self):
         n = self.params.real_time_flows
-        lambda_ = self.params.real_time_lambdas
+        lamb = self.params.real_time_lambdas
         mu = self.params.real_time_mus
         b = self.params.real_time_resources
 
@@ -92,85 +75,112 @@ class Solver:
 
         v = self.params.beam_capacity
 
-        I = lambda x: 1.0 if x else 0.0
-        current_error = 1000
+        error = 1000
         iteration = 0
-
-        while current_error > self.epsilon:
+        while not (error < self.max_eps or iteration > self.max_iter):
             iteration += 1
-            for state in self.prev_states_dct.keys():
+            error = 0
+
+            for state in self.states.keys():
                 *i_vec, d = state
 
                 state_ = State(i_vec, d)
 
-                l = sum(i_k * b_k for (i_k, b_k) in zip(i_vec, b))
-                d_limit = (v - l) // b_max
+                l = np.dot(i_vec, b)
+                l_tot = l + d * b_min
+                d_lim = (v - l) // b_max
 
-                if l + d * b_min > v:
-                    raise ValueError(f"{l=}, {d=}, {b_min=}")
+                real_time_arrival_d = sum(lamb[k] * (l_tot + b[k] <= v) for k in range(n))
+                real_time_serv_d = sum(i_vec[k] * mu[k] * (i_vec[k] > 0) for k in range(n))
 
-                real_time_arrival_d = sum(
-                    lambda_[k] * I(l + d * b_min + b[k] <= v) for k in range(n)
-                )
-                real_time_serv_d = sum(i_vec[k] * mu[k] * I(i_vec[k] >= 1) for k in range(n))
-                data_arr_d = lambda_e * I(l + d * b_min + b_min <= v)
-                data_serv_d = (v - l) * mu_e * I(d > d_limit) + d * b_max * mu_e * I(
-                    1 <= d <= d_limit
-                )
+                data_arr_d = lambda_e * (l_tot + b_min <= v)
+                data_serv_d = mu_e * (d > 0) * ((v - l) * (d > d_lim) + d * b_max * (d <= d_lim))
 
-                denominator = real_time_arrival_d + real_time_serv_d + data_arr_d + data_serv_d
+                denr = real_time_arrival_d + real_time_serv_d + data_arr_d + data_serv_d
 
                 real_time_arr_n = sum(
-                    self.prob(state_.change_ik(k, delta=-1)) * lambda_[k] * I(i_vec[k] >= 1)
-                    for k in range(n)
+                    self.prob(state_.ik_(k, -1)) * lamb[k] * (i_vec[k] > 0) for k in range(n)
                 )
                 real_time_serv_n = sum(
-                    self.prob(state_.change_ik(k, delta=+1))
-                    * (i_vec[k] + 1)
-                    * mu[k]
-                    * I(l + d * b_min + b[k] <= v)
+                    self.prob(state_.ik_(k, +1)) * (i_vec[k] + 1) * mu[k] * (l_tot + b[k] <= v)
                     for k in range(n)
                 )
-                data_arr_n = (
-                    self.prob(state_.change_d(-1)) * lambda_e * I(l + d * b_min <= v and d >= 1)
-                )
+                data_arr_n = self.prob(state_.d_(-1)) * lambda_e * (l_tot <= v and d > 0)
                 data_serv_n = (
-                    self.prob(state_.change_d(+1))
-                    * I(l + d * b_min + b_min <= v)
-                    * (
-                        (v - l) * mu_e * I(d + 1 > d_limit)
-                        + (d + 1) * b_max * mu_e * I(d + 1 <= d_limit)
-                    )
+                    self.prob(state_.d_(+1))
+                    * (l_tot + b_min <= v and d + 1 > 0)
+                    * mu_e
+                    * ((v - l) * (d + 1 > d_lim) + (d + 1) * b_max * (d + 1 <= d_lim))
                 )
 
-                numerator = real_time_arr_n + real_time_serv_n + data_arr_n + data_serv_n
-                self.next_states_dct[state] = numerator / denominator
+                numr = real_time_arr_n + real_time_serv_n + data_arr_n + data_serv_n
+                error += (self.states[state] - numr / denr) / self.states[state]
+                self.states[state] = numr / denr
 
-            assert len(self.next_states_dct) == len(self.prev_states_dct)
-            current_error = self.calculate_error()
-            self.prev_states_dct = {key: value for (key, value) in self.next_states_dct.items()}
-
-        return self.prev_states_dct, iteration
+        return self.states, iteration
 
     def prob(self, state: State):
         i_vec, d = state.i_vec, state.d
 
         state_ = (*i_vec, d)
 
-        if state_ in self.next_states_dct:
-            return self.next_states_dct[state_]
-        elif state_ in self.prev_states_dct:
-            return self.prev_states_dct[state_]
-        else:
-            return 0
+        return self.states[state_] if (state_ in self.states) else 0
+
+    def calculate_metrics(self, states: dict[tuple, float]) -> Metrics:
+        metrics = Metrics(
+            rt_request_rej_prob=[0] * self.params.real_time_flows,
+            mean_rt_requests_in_service=[0] * self.params.real_time_flows,
+            mean_resources_per_rt_flow=[0] * self.params.real_time_flows,
+        )
+
+        for state in states.keys():
+            *i_vec, d = state
+            b_min = self.params.data_resources_min
+
+            v = self.params.beam_capacity
+            l = np.dot(i_vec, self.params.real_time_resources) + b_min * d
+
+            for k in range(self.params.real_time_flows):
+                b_k = self.params.real_time_resources[k]
+                metrics.mean_rt_requests_in_service[k] += i_vec[k] * states[state]
+
+                if l + b_k > v:
+                    metrics.rt_request_rej_prob[k] += states[state]
+
+            if l + b_min > v:
+                metrics.data_request_rej_prob += states[state]
+
+            b_max = self.params.data_resources_max
+            d_limit = (v - np.dot(i_vec, self.params.real_time_resources)) // b_max
+            data_res = (v - np.dot(i_vec, self.params.real_time_resources)) * (
+                d > d_limit
+            ) + d * b_max * (d <= d_limit) * (d > 0)
+            metrics.mean_resources_per_data_flow += data_res * states[state]
+            metrics.mean_data_requests_in_service += d * states[state]
+
+        for k in range(self.params.real_time_flows):
+            metrics.mean_resources_per_rt_flow[k] = (
+                metrics.mean_rt_requests_in_service[k] * self.params.real_time_resources[k]
+            )
+
+        metrics.mean_resources_per_data_request = (
+            metrics.mean_resources_per_data_flow / metrics.mean_data_requests_in_service
+        )
+
+        metrics.mean_data_request_service_time = metrics.mean_data_requests_in_service / (
+            self.params.data_lambda * 1 * (1 - metrics.data_request_rej_prob)
+        )
+        return metrics
 
 
 possible_states = get_possible_states(test_params)
 print(len(possible_states))
 
-solver = Solver(test_params, possible_states, 1e-7)
+solver = Solver(test_params, possible_states, 1e-7, 35000)
+start_time = time.time()
 solution_states, it = solver.solve()
-print(f"{it=}")
+end_time = time.time()
+print(f"{it=}, time = {end_time - start_time}")
 # normalize
 
 norm = sum(solution_states.values())
@@ -178,34 +188,48 @@ norm = sum(solution_states.values())
 for key, value in solution_states.items():
     solution_states[key] = value / norm
 
-print(sum(solution_states.values()))
+print("sum probs", sum(solution_states.values()))
 
 
-pi_1 = 0
-pi_2 = 0
-pi_e = 0
+metrics = solver.calculate_metrics(solution_states)
 
-for state in solution_states.keys():
-    v = test_params.beam_capacity
-    b_min = test_params.data_resources_min
-    i_1, i_2, d = state
-    b_1, b_2 = test_params.real_time_resources
+m_e = metrics.mean_resources_per_data_flow
+pi_e = metrics.data_request_rej_prob
 
-    l = i_1 * b_1 + i_2 * b_2
+e1 = test_params.data_lambda * 1
+e2 = test_params.data_lambda * 1 * pi_e + m_e * test_params.data_mu
 
-    if l + d * b_min + b_1 > v:
-        pi_1 += solution_states[state]
-    if l + d * b_min + b_2 > v:
-        pi_2 += solution_states[state]
-    if l + d * b_min + b_min > v:
-        pi_e += solution_states[state]
-
-print(f"{pi_1=:.4f}, {pi_2=:.4f}, {pi_e=:.4f}")
+print(f"{e1:.5f}", f"{e2:.5f}", np.isclose(e1, e2))
 
 
-a = (
-    np.isclose(pi_1, 0.005795995193366042)
-    and np.isclose(pi_2, 0.03901275178165448)
-    and np.isclose(pi_e, 0.005795995193366042)
-)
-print(a)
+lambda_1 = test_params.real_time_lambdas[0]
+# lambda_2 = test_params.real_time_lambdas[1]
+
+mu_1 = test_params.real_time_mus[0]
+# mu_2 = test_params.real_time_mus[1]
+
+b_1 = test_params.real_time_resources[0]
+# b_2 = test_params.real_time_resources[1]
+
+pi_1 = metrics.rt_request_rej_prob[0]
+# pi_2 = metrics.rt_request_rej_prob[1]
+
+m_1 = metrics.mean_resources_per_rt_flow[0]
+# m_2 = metrics.mean_resources_per_rt_flow[1]
+
+e1 = lambda_1 * b_1
+e2 = lambda_1 * b_1 * pi_1 + m_1 * mu_1
+print(f"{e1:.5f}", f"{e2:.5f}", np.isclose(e1, e2))
+
+# e1 = lambda_2 * b_2
+# e2 = lambda_2 * b_2 * pi_2 + m_2 * mu_2
+print(f"{e1:.5f}", f"{e2:.5f}", np.isclose(e1, e2))
+
+pi_1 = metrics.rt_request_rej_prob[0]
+pi_2 = 0  # metrics.rt_request_rej_prob[1]
+pi_e = metrics.data_request_rej_prob
+
+print(f"{pi_1=:.5f}, {pi_2=:.5f}, {pi_e=:.5f}")
+
+
+print(metrics)
