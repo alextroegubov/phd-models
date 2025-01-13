@@ -13,16 +13,17 @@ from abc import abstractmethod, ABC
 import random
 import numpy as np
 from utils import ParametersSet
+import time
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(filename="simulation.log", filemode="w", level=logging.INFO, encoding="utf-8")
 
 test_params = ParametersSet(2, [15, 3], [1, 1], [1, 5], 1, 50, 1, 1, 50)
 
-# class StatsAssistent
 
 class StatsBaseClass(ABC):
     """Base class for statistics collection."""
+
     def __init__(self):
         self.stats_enabled = False
 
@@ -34,15 +35,21 @@ class StatsBaseClass(ABC):
     @staticmethod
     def if_stats_enabled(method):
         """Decorator to enable statistics collection for a method."""
+
         def wrapper(self, *args, **kwargs):
             if self.stats_enabled:
                 return method(self, *args, **kwargs)
             else:
                 return None
+
         return wrapper
 
     @abstractmethod
     def _start_stats_collection(self):
+        pass
+
+    @abstractmethod
+    def get_stats(self):
         pass
 
 
@@ -94,7 +101,7 @@ class Simulator:
         return cls._instance
 
     @classmethod
-    def schedule_event(cls, time: float, action: Callable[[], None], e_type: EventType) -> int:
+    def schedule_event(cls, time_at: float, action: Callable[[], None], e_type: EventType) -> int:
         """Schedules an event at a specific simulation time.
 
         :param time: Time at which the event occur
@@ -251,17 +258,18 @@ class Request:
         """Updates the served size and last allocation time of the request.
         Does not change the current allocation resources.
         """
-        time = Simulator.get_current_time()
-        served_size = (time - self.last_alloc_time) * self.current_alloc_resource
+        sim_time = Simulator.get_current_time()
+        served_size = (sim_time - self.last_alloc_time) * self.current_alloc_resource
 
         logger.debug(
-            ("%4.5f " + str(self) + ": updated:  new served_size=%2.5f"),
-            time,
+            "%4.5f %s: updated:  new served_size=%2.5f",
+            sim_time,
+            str(self),
             self.served_size + served_size,
         )
 
         self.served_size += served_size
-        self.last_alloc_time = time
+        self.last_alloc_time = sim_time
 
     def realloc_resources(self, new_alloc_resources: int) -> float:
         """Reallocate resources for the request and return the remaining service time.
@@ -271,8 +279,9 @@ class Request:
         self._update_served_size_and_last_alloc_time()
 
         logger.debug(
-            ("%4.5f " + str(self) + ": update: new alloc_res = %s"),
+            "%4.5f %s: update: new alloc_res = %s",
             Simulator.get_current_time(),
+            str(self),
             new_alloc_resources,
         )
 
@@ -281,8 +290,9 @@ class Request:
 
         if service_time_left < 0:
             logger.error(
-                ("%4.5f " + str(self) + ": negative service time left: %4.5f"),
+                "%4.5f %s: negative service time left: %4.5f",
                 Simulator.get_current_time(),
+                str(self),
                 service_time_left,
             )
 
@@ -293,7 +303,7 @@ class Request:
         self._update_served_size_and_last_alloc_time()
         self.current_alloc_resource = 0
 
-        logger.debug(("%4.5f " + str(self) + ": finish service"), Simulator.get_current_time())
+        logger.debug("%4.5f %s: finish service", Simulator.get_current_time(), str(self))
 
 
 class Flow(StatsBaseClass, ABC):
@@ -328,8 +338,8 @@ class Flow(StatsBaseClass, ABC):
         self.total_serviced_requests = 0
         self.total_rejected_requests = 0
 
-        self.request_service_time: list[float] = []
-        self.request_mean_resources: list[float] = []
+        self.request_service_time: float = 0
+        self.request_mean_resources: float = 0
 
     def set_on_arrival_callback(self, fn: Callable[[Request], None]):
         """Set the callback function to be executed when a request arrives."""
@@ -349,7 +359,7 @@ class Flow(StatsBaseClass, ABC):
             min_resources=self._get_min_resources(),
         )
 
-        logger.debug(("%4.5f " + str(req) + ": generated"), Simulator.get_current_time())
+        logger.debug("%4.5f %s: generated", Simulator.get_current_time(), str(req))
 
         self.request_generated()
 
@@ -364,7 +374,7 @@ class Flow(StatsBaseClass, ABC):
         """Schedules the request arrival event."""
         arrival_time = self.generate_next_arrival_time() + Simulator.get_current_time()
         Simulator.schedule_event(
-            time=arrival_time,
+            time_at=arrival_time,
             action=self.generate_request,
             e_type=EventType.REQUEST_ARRIVAL,
         )
@@ -391,8 +401,8 @@ class Flow(StatsBaseClass, ABC):
             "total_accepted_requests": self.total_accepted_requests,
             "total_serviced_requests": self.total_serviced_requests,
             "total_rejected_requests": self.total_rejected_requests,
-            "request_service_time": np.mean(self.request_service_time),
-            "request_mean_resources": np.mean(self.request_mean_resources),
+            "request_service_time": self.request_service_time,
+            "request_mean_resources": self.request_mean_resources,
         }
 
     @StatsBaseClass.if_stats_enabled
@@ -408,11 +418,19 @@ class Flow(StatsBaseClass, ABC):
     @StatsBaseClass.if_stats_enabled
     def request_serviced(self, req: Request):
         """Increments the number of serviced requests and stores the QoS stats."""
-        self.total_serviced_requests += 1
         service_time = req.end_service_time - req.arrival_time
 
-        self.request_service_time.append(service_time)
-        self.request_mean_resources.append(req.total_size / service_time)
+        # recursive mean:
+        self.request_service_time = (
+            self.total_serviced_requests * self.request_service_time + service_time
+        ) / (self.total_serviced_requests + 1)
+
+        self.request_mean_resources = (
+            self.total_serviced_requests * self.request_mean_resources
+            + req.total_size / service_time
+        ) / (self.total_serviced_requests + 1)
+
+        self.total_serviced_requests += 1
 
     @StatsBaseClass.if_stats_enabled
     def request_generated(self):
@@ -516,12 +534,10 @@ class Network(StatsBaseClass):
         time = Simulator.get_current_time() - self.stats_start_time
         mean_utilization = self.mean_utilization / time
         mean_flow_reqs_in_service = {
-            flow_id: val / time
-            for flow_id, val in self.mean_flow_reqs_in_service.items()
+            flow_id: val / time for flow_id, val in self.mean_flow_reqs_in_service.items()
         }
         mean_flow_res_in_service = {
-            flow_id: val / time
-            for flow_id, val in self.mean_flow_res_in_service.items()
+            flow_id: val / time for flow_id, val in self.mean_flow_res_in_service.items()
         }
 
         return {
@@ -603,11 +619,11 @@ class Network(StatsBaseClass):
         req_str = f"{Simulator.get_current_time():4.5f} " + str(new_req)
 
         if new_req.min_resources + min_required_resources <= self.capacity:
-            logger.debug(req_str + ": accepted")
+            logger.debug("%s: %s", req_str, "accepted")
             self.accept_request(new_req)
             its_flow.request_accepted()
         else:
-            logger.debug(req_str + ": rejected")
+            logger.debug("%s: %s", req_str, "rejected")
             its_flow.request_rejected()
 
     def accept_request(self, new_req: Request):
@@ -620,7 +636,7 @@ class Network(StatsBaseClass):
             service_time = new_req.realloc_resources(its_flow.fixed_resource)
             # schedule service event
             event_id = Simulator.schedule_event(
-                time=Simulator.get_current_time() + service_time,
+                time_at=Simulator.get_current_time() + service_time,
                 action=partial(self.request_service_handler, new_req.request_id),
                 e_type=EventType.REQUEST_SERVICE,
             )
@@ -671,7 +687,7 @@ class Network(StatsBaseClass):
             len(elastic_data_requests),
         )
 
-        logger.debug(self._log_str_with_distr("old"))
+        logger.debug("%s", self._log_str_with_distr("old"))
 
         if len(elastic_data_requests) == 0:
             return
@@ -699,18 +715,19 @@ class Network(StatsBaseClass):
             suggested_resources = rfloor_res + 1 if num_req_ceil_res > 0 else rfloor_res
             num_req_ceil_res -= 1
             alloc_resources = min(suggested_resources, its_flow.get_max_resources())
-            # allocate new resources to request
-            new_service_time = req.realloc_resources(alloc_resources)
-            # cancel previous service event
-            if req.service_event_id is not None:
-                Simulator.cancel_event(req.service_event_id)
-            # schedule new service event
-            event_id = Simulator.schedule_event(
-                time=Simulator.get_current_time() + new_service_time,
-                action=partial(self.request_service_handler, req.request_id),
-                e_type=EventType.REQUEST_SERVICE,
-            )
-            req.service_event_id = event_id
+            # allocate new resources to request if needed
+            if req.current_alloc_resource != alloc_resources:
+                new_service_time = req.realloc_resources(alloc_resources)
+                # cancel previous service event
+                if req.service_event_id is not None:
+                    Simulator.cancel_event(req.service_event_id)
+                # schedule new service event
+                event_id = Simulator.schedule_event(
+                    time_at=Simulator.get_current_time() + new_service_time,
+                    action=partial(self.request_service_handler, req.request_id),
+                    e_type=EventType.REQUEST_SERVICE,
+                )
+                req.service_event_id = event_id
 
         logger.debug(self._log_str_with_distr("new"))
 
@@ -746,17 +763,23 @@ test_params = ParametersSet(1, [0.042], [1/300], [3], 1, 5, 4.2, 1/16, 50)
 simulator = Simulator.get_instance()
 network = Network(test_params)
 network.add_flows(1, 1)
-simulator.run(100000)
 
-print(network.get_stats())
-for flow in network.flows_lookup.values():
-    print(flow.get_stats())
+time_start = time.time()
+simulator.run(100000)
+time_run_1 = time.time()
+
+print(f"w/o stats: {time_run_1 - time_start:5.3f}")
+
 
 network.enable_stats_collection()
 for flow in network.flows_lookup.values():
     flow.enable_stats_collection()
 
-simulator.run(50000 * 10)
+time_start = time.time()
+simulator.run(50000 * 4)
+time_run_2 = time.time()
+
+print(f"with stats: {time_run_2 - time_start:5.3f}")
 
 print(network.get_stats())
 for flow in network.flows_lookup.values():
