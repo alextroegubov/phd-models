@@ -12,7 +12,7 @@ from abc import abstractmethod, ABC
 
 import random
 import numpy as np
-from utils import ParametersSet
+from utils import ParametersSet, Metrics
 import time
 
 logger = logging.getLogger(__name__)
@@ -567,7 +567,7 @@ class Network(StatsBaseClass):
         for flow_id in self.flows_lookup:
             self.mean_flow_reqs_in_service[flow_id] += duration * flow_reqs_in_service[flow_id]
             self.mean_flow_res_in_service[flow_id] += duration * flow_res_in_service[flow_id]
-        
+
         self.mean_utilization += duration * utilization
 
         self.last_stats_update = current_time
@@ -752,11 +752,50 @@ class Network(StatsBaseClass):
         self.redistribute_elastic_resources()
 
 
+def convert_stats_to_metrics(params: ParametersSet, network: Network):
+    net_stats = network.get_stats()
+    n_rt_flows = params.real_time_flows
+
+    flows_stats = {
+        flow_id: network.flows_lookup[flow_id].get_stats() for flow_id in network.flows_lookup
+    }
+
+    metrics = Metrics(
+        rt_request_rej_prob=[0] * n_rt_flows,
+        mean_rt_requests_in_service=[0] * n_rt_flows,
+        mean_resources_per_rt_flow=[0] * n_rt_flows,
+    )
+
+    for i in range(n_rt_flows):
+        stats = flows_stats[i]
+
+        metrics.rt_request_rej_prob[i] = (
+            stats["total_rejected_requests"] / stats["total_gen_requests"]
+        )
+
+        metrics.mean_rt_requests_in_service[i] = net_stats["mean_flow_reqs_in_service"][i]
+
+        metrics.mean_resources_per_rt_flow[i] = net_stats["mean_flow_res_in_service"][i]
+
+    ed_stats = flows_stats[n_rt_flows]
+    metrics.beam_utilization = net_stats["mean_utilization"]
+    metrics.data_request_rej_prob = (
+        ed_stats["total_rejected_requests"] / ed_stats["total_gen_requests"]
+    )
+
+    metrics.mean_data_request_service_time = ed_stats["request_service_time"]
+    metrics.mean_resources_per_data_request = ed_stats["request_mean_resources"]
+    metrics.mean_data_requests_in_service = net_stats["mean_flow_reqs_in_service"][n_rt_flows]
+    metrics.mean_resources_per_data_flow = net_stats["mean_flow_res_in_service"][n_rt_flows]
+
+    return metrics
+
+
 random.seed(1)
 test_params = ParametersSet(2, [15, 3], [1, 1], [1, 5], 1, 50, 1, 1, 50)
 test_params = ParametersSet(1, [3], [1], [5], 1, 50, 1, 1, 50)
 
-test_params = ParametersSet(1, [0.042], [1/300], [3], 1, 5, 4.2, 1/16, 50)
+test_params = ParametersSet(1, [0.042], [1 / 300], [3], 1, 5, 4.2, 1 / 16, 50)
 
 simulator = Simulator.get_instance()
 network = Network(test_params)
@@ -774,7 +813,7 @@ for flow in network.flows_lookup.values():
     flow.enable_stats_collection()
 
 time_start = time.time()
-simulator.run(50000 * 4)
+simulator.run(50000 * 20)
 time_run_2 = time.time()
 
 print(f"with stats: {time_run_2 - time_start:5.3f}")
@@ -782,3 +821,7 @@ print(f"with stats: {time_run_2 - time_start:5.3f}")
 print(network.get_stats())
 for flow in network.flows_lookup.values():
     print(flow.get_stats())
+
+
+metrics = convert_stats_to_metrics(test_params, network)
+print(metrics)
