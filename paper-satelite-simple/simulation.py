@@ -15,11 +15,35 @@ import numpy as np
 from utils import ParametersSet
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(filename="simulation.log", filemode="w", level=logging.DEBUG, encoding="utf-8")
+logging.basicConfig(filename="simulation.log", filemode="w", level=logging.INFO, encoding="utf-8")
 
 test_params = ParametersSet(2, [15, 3], [1, 1], [1, 5], 1, 50, 1, 1, 50)
 
 # class StatsAssistent
+
+class StatsBaseClass(ABC):
+    """Base class for statistics collection."""
+    def __init__(self):
+        self.stats_enabled = False
+
+    def enable_stats_collection(self):
+        """Enable statistics collection."""
+        self.stats_enabled = True
+        self._start_stats_collection()
+
+    @staticmethod
+    def if_stats_enabled(method):
+        """Decorator to enable statistics collection for a method."""
+        def wrapper(self, *args, **kwargs):
+            if self.stats_enabled:
+                return method(self, *args, **kwargs)
+            else:
+                return None
+        return wrapper
+
+    @abstractmethod
+    def _start_stats_collection(self):
+        pass
 
 
 class EventType(Enum):
@@ -272,7 +296,7 @@ class Request:
         logger.debug(("%4.5f " + str(self) + ": finish service"), Simulator.get_current_time())
 
 
-class Flow(ABC):
+class Flow(StatsBaseClass, ABC):
     """Class for modeling traffic flows in the network."""
 
     def __init__(
@@ -289,6 +313,8 @@ class Flow(ABC):
         :param service_rate: Request service rate (1 / average service time)
         :param on_arrival_callback: Callback function to be executed when a request arrives
         """
+        super().__init__()
+
         self.flow_id = flow_id
         self.arrival_rate = arrival_rate
         self.service_rate = service_rate
@@ -296,13 +322,14 @@ class Flow(ABC):
         self.is_active = False
 
         # some statistics
+        self.stats_start_time = 0
         self.total_gen_requests = 0
         self.total_accepted_requests = 0
         self.total_serviced_requests = 0
         self.total_rejected_requests = 0
 
-        self.actual_service_time: list[float] = []
-        self.actual_mean_resources: list[float] = []
+        self.request_service_time: list[float] = []
+        self.request_mean_resources: list[float] = []
 
     def set_on_arrival_callback(self, fn: Callable[[Request], None]):
         """Set the callback function to be executed when a request arrives."""
@@ -324,11 +351,11 @@ class Flow(ABC):
 
         logger.debug(("%4.5f " + str(req) + ": generated"), Simulator.get_current_time())
 
-        self.total_gen_requests += 1
+        self.request_generated()
+
         if self.on_arrival_callback is not None:
             self.on_arrival_callback(req)
         else:
-            pass
             assert False, "callback not set"
             # add log that on_arrival_callback not set
         self._schedule_request()
@@ -352,21 +379,45 @@ class Flow(ABC):
                 "%s Flow[id=%s] is already active", Simulator.get_current_time(), self.flow_id
             )
 
+    def _start_stats_collection(self):
+        """Starts the statistics collection."""
+        self.stats_start_time = Simulator.get_current_time()
+
+    def get_stats(self):
+        """Return the statistics collected for the flow."""
+        return {
+            "stats_start_time": self.stats_start_time,
+            "total_gen_requests": self.total_gen_requests,
+            "total_accepted_requests": self.total_accepted_requests,
+            "total_serviced_requests": self.total_serviced_requests,
+            "total_rejected_requests": self.total_rejected_requests,
+            "request_service_time": np.mean(self.request_service_time),
+            "request_mean_resources": np.mean(self.request_mean_resources),
+        }
+
+    @StatsBaseClass.if_stats_enabled
     def request_accepted(self):
         """Increments the number of accepted requests."""
         self.total_accepted_requests += 1
 
+    @StatsBaseClass.if_stats_enabled
     def request_rejected(self):
         """Increments the number of rejected requests."""
         self.total_rejected_requests += 1
 
+    @StatsBaseClass.if_stats_enabled
     def request_serviced(self, req: Request):
         """Increments the number of serviced requests and stores the QoS stats."""
         self.total_serviced_requests += 1
         service_time = req.end_service_time - req.arrival_time
 
-        self.actual_service_time.append(service_time)
-        self.actual_mean_resources.append(req.total_size / service_time)
+        self.request_service_time.append(service_time)
+        self.request_mean_resources.append(req.total_size / service_time)
+
+    @StatsBaseClass.if_stats_enabled
+    def request_generated(self):
+        """Increment the number of generated requests."""
+        self.total_gen_requests += 1
 
     @abstractmethod
     def _get_min_resources(self) -> int:
@@ -425,18 +476,87 @@ class ElasticDataFlow(Flow):
         return random.expovariate(self.service_rate)
 
 
-class Network:
+class Network(StatsBaseClass):
     """Class for the network model."""
 
     def __init__(self, params: ParametersSet):
         """Initialize network parameters.
         :param params: Network parameters
         """
+        super().__init__()
         self.params: ParametersSet = params
         self.capacity = self.params.beam_capacity
 
         self.requests_lookup: dict[int, Request] = {}
         self.flows_lookup: dict[int, Flow] = {}
+
+        # some stats
+        self.stats_start_time = 0
+        self.last_stats_update = 0
+        # allocated_resources * time
+        self.mean_utilization = 0
+        # {flow_id: num_reqs * time}
+        self.mean_flow_reqs_in_service: dict[int, float] = {}
+        # {flow_id: num_resources * time}
+        self.mean_flow_res_in_service: dict[int, float] = {}
+
+    def _start_stats_collection(self):
+        """Start the statistics collection."""
+        self.stats_start_time = Simulator.get_current_time()
+        self.last_stats_update = Simulator.get_current_time()
+
+        self.mean_utilization = 0
+        self.mean_flow_reqs_in_service = {flow_id: 0 for flow_id in self.flows_lookup}
+        self.mean_flow_res_in_service = {flow_id: 0 for flow_id in self.flows_lookup}
+
+    def get_stats(self):
+        """Return the statistics collected for the network."""
+
+        # average over simulation time
+        time = Simulator.get_current_time() - self.stats_start_time
+        mean_utilization = self.mean_utilization / time
+        mean_flow_reqs_in_service = {
+            flow_id: val / time
+            for flow_id, val in self.mean_flow_reqs_in_service.items()
+        }
+        mean_flow_res_in_service = {
+            flow_id: val / time
+            for flow_id, val in self.mean_flow_res_in_service.items()
+        }
+
+        return {
+            "stats_start_time": self.stats_start_time,
+            "last_stats_update": self.last_stats_update,
+            "mean_utilization": mean_utilization,
+            "mean_flow_reqs_in_service": mean_flow_reqs_in_service,
+            "mean_flow_res_in_service": mean_flow_res_in_service,
+        }
+
+    @StatsBaseClass.if_stats_enabled
+    def update_utilization_stats(self):
+        """Update the utilization statistics."""
+        current_time = Simulator.get_current_time()
+        if current_time == self.last_stats_update:
+            return
+
+        duration = current_time - self.last_stats_update
+        utilization = 0
+        flow_reqs_in_service = {flow_id: 0 for flow_id in self.flows_lookup}
+        flow_res_in_service = {flow_id: 0 for flow_id in self.flows_lookup}
+
+        for req in self.requests_lookup.values():
+            flow_id = req.flow_id
+            flow_reqs_in_service[flow_id] += 1
+            flow_res_in_service[flow_id] += req.current_alloc_resource
+            utilization += req.current_alloc_resource
+
+        for flow_id in self.flows_lookup:
+            self.mean_flow_reqs_in_service[flow_id] += duration * flow_reqs_in_service[flow_id]
+            self.mean_flow_res_in_service[flow_id] += duration * flow_res_in_service[flow_id]
+        
+        self.mean_utilization += duration * utilization
+
+        self.last_stats_update = current_time
 
     def add_flows(self, n_real_time_flows: int, n_elastic_flows: int):
         """Add real-time data and elastic data flows to the network."""
@@ -492,6 +612,7 @@ class Network:
 
     def accept_request(self, new_req: Request):
         """Process accepting a new request."""
+        self.update_utilization_stats()
         its_flow = self.flows_lookup[new_req.flow_id]
         self.requests_lookup[new_req.request_id] = new_req
 
@@ -521,6 +642,8 @@ class Network:
 
     def redistribute_elastic_resources(self):
         """Dynamically adjust resource allocation among elastic requests."""
+        self.update_utilization_stats()
+
         min_required_resources = sum(req.min_resources for req in self.requests_lookup.values())
         if min_required_resources > self.capacity:
             logger.error(
@@ -592,6 +715,7 @@ class Network:
         logger.debug(self._log_str_with_distr("new"))
 
     def request_service_handler(self, req_id: int):
+        self.update_utilization_stats()
         req = self.requests_lookup[req_id]
         req.end_service_time = Simulator.get_current_time()
         req.finish_service()
@@ -615,7 +739,25 @@ class Network:
 
 random.seed(1)
 test_params = ParametersSet(2, [15, 3], [1, 1], [1, 5], 1, 50, 1, 1, 50)
+test_params = ParametersSet(1, [3], [1], [5], 1, 50, 1, 1, 50)
+
+test_params = ParametersSet(1, [0.042], [1/300], [3], 1, 5, 4.2, 1/16, 50)
+
 simulator = Simulator.get_instance()
 network = Network(test_params)
-network.add_flows(2, 1)
-simulator.run(1000)
+network.add_flows(1, 1)
+simulator.run(100000)
+
+print(network.get_stats())
+for flow in network.flows_lookup.values():
+    print(flow.get_stats())
+
+network.enable_stats_collection()
+for flow in network.flows_lookup.values():
+    flow.enable_stats_collection()
+
+simulator.run(50000 * 10)
+
+print(network.get_stats())
+for flow in network.flows_lookup.values():
+    print(flow.get_stats())
