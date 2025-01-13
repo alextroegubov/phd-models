@@ -16,17 +16,36 @@ class ParametersSet:
 
     beam_capacity: int
 
+    def __str__(self) -> str:
+
+        rt_gen = zip(self.real_time_lambdas, self.real_time_mus, self.real_time_resources)
+        real_time_params = "\n".join(
+            f"  Flow {i}:\n\tλ = {lam:.5f},\n\tμ = {mu:.5f},\n\tb = {res}"
+            for i, (lam, mu, res) in enumerate(rt_gen)
+        )
+
+        return (
+            f"\nParametersSet:\n"
+            f"  Beam Capacity: {self.beam_capacity}\n"
+            f"  Real-Time Flows: {self.real_time_flows}\n"
+            f"  {real_time_params}\n"
+            f"  Elastic Data Flow\n"
+            f"    b_min = {self.data_resources_min}\n"
+            f"    b_max = {self.data_resources_max}\n"
+            f"    λ = {self.data_lambda:.5f}, μ = {self.data_mu:.5f}"
+        )
+
 
 @dataclass
 class Metrics:
     # pi_k, k=1,...,n and pi_e
-    rt_request_rej_prob: list[float] = None
+    rt_request_rej_prob: Optional[list[float]] = None
     data_request_rej_prob: float = 0
     # y_k, k=1,...n and y_e
-    mean_rt_requests_in_service: list[float] = None
+    mean_rt_requests_in_service: Optional[list[float]] = None
     mean_data_requests_in_service: float = 0
     # m_k, k=1,...n and m_e
-    mean_resources_per_rt_flow: list[float] = None
+    mean_resources_per_rt_flow: Optional[list[float]] = None
     mean_resources_per_data_flow: float = 0
     # W and b_e
     mean_data_request_service_time: float = 0
@@ -45,7 +64,7 @@ class Metrics:
             return ", ".join(f"{x:.3f}" for x in lst) if lst else "[]"
 
         return (
-            f"Metrics: {self.text}\n"
+            f"\nMetrics: {self.text}\n"
             f"  Overall:\n"
             f"      Beam Utilization            : {self.beam_utilization:.4f}\n"
             f"  Real-time flows:\n"
