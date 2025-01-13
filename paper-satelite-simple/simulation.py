@@ -18,8 +18,6 @@ import time
 logger = logging.getLogger(__name__)
 logging.basicConfig(filename="simulation.log", filemode="w", level=logging.INFO, encoding="utf-8")
 
-test_params = ParametersSet(2, [15, 3], [1, 1], [1, 5], 1, 50, 1, 1, 50)
-
 
 class StatsBaseClass(ABC):
     """Base class for statistics collection."""
@@ -72,7 +70,7 @@ class Event:
     :param event_id: Unique identifier for the event
     """
 
-    time: float
+    time_at: float
     action: Callable[[], None] = field(compare=False)
     type: EventType = field(compare=False)
     event_id: int = field(compare=False)
@@ -111,7 +109,7 @@ class Simulator:
         """
         instance = cls.get_instance()
         event_id = instance._get_next_id()
-        event = Event(time, action, e_type, event_id)
+        event = Event(time_at, action, e_type, event_id)
         instance.event_lookup[event_id] = event
         instance.event_queue.put(event, block=False)
 
@@ -120,7 +118,7 @@ class Simulator:
             instance.get_current_time(),
             event_id,
             e_type.name,
-            time,
+            time_at,
             instance.event_queue.qsize(),
         )
         return event_id
@@ -141,7 +139,7 @@ class Simulator:
                 instance.get_current_time(),
                 event_id,
                 event.type.name,
-                event.time,
+                event.time_at,
             )
             # make fields invalid
             event.type = EventType.CANCELLED
@@ -157,13 +155,13 @@ class Simulator:
         while not instance.event_queue.empty() and instance.processed_events < number_of_events:
             event = instance.event_queue.get(block=False)
             if event.type is not EventType.CANCELLED:
-                instance.current_time = event.time
+                instance.current_time = event.time_at
                 logger.debug(
                     "%4.5f Event[id=%s, type=%s, time=%4.5f] executed; queue_size=%s",
                     instance.get_current_time(),
                     event.event_id,
                     event.type.name,
-                    event.time,
+                    event.time_at,
                     instance.event_queue.qsize(),
                 )
                 event.action()
@@ -531,13 +529,13 @@ class Network(StatsBaseClass):
         """Return the statistics collected for the network."""
 
         # average over simulation time
-        time = Simulator.get_current_time() - self.stats_start_time
-        mean_utilization = self.mean_utilization / time
+        time_at = Simulator.get_current_time() - self.stats_start_time
+        mean_utilization = self.mean_utilization / time_at
         mean_flow_reqs_in_service = {
-            flow_id: val / time for flow_id, val in self.mean_flow_reqs_in_service.items()
+            flow_id: val / time_at for flow_id, val in self.mean_flow_reqs_in_service.items()
         }
         mean_flow_res_in_service = {
-            flow_id: val / time for flow_id, val in self.mean_flow_res_in_service.items()
+            flow_id: val / time_at for flow_id, val in self.mean_flow_res_in_service.items()
         }
 
         return {
