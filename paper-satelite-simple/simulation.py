@@ -9,11 +9,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from functools import partial
 from abc import abstractmethod, ABC
+import time
+import argparse
 
 import random
 import numpy as np
 from utils import ParametersSet, Metrics
-import time
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(filename="simulation.log", filemode="w", level=logging.INFO, encoding="utf-8")
@@ -37,8 +38,8 @@ class StatsBaseClass(ABC):
         def wrapper(self, *args, **kwargs):
             if self.stats_enabled:
                 return method(self, *args, **kwargs)
-            else:
-                return None
+
+            return None
 
         return wrapper
 
@@ -64,7 +65,7 @@ class EventType(Enum):
 class Event:
     """Class for simulation events.
 
-    :param time: Time at which the event occurs
+    :param time_at: Time at which the event occurs
     :param action: Function to be executed when the event occurs
     :param type: Type of the event
     :param event_id: Unique identifier for the event
@@ -84,10 +85,6 @@ class Simulator:
         """Action placeholder for cancelled events."""
         raise AttributeError("Cancelled event executed")
 
-    # def __new__(cls):
-    #     if not hasattr(cls, "_instance"):
-    #         cls._instance = super(Simulator, cls).__new__(cls)
-    #     return cls._instance
     _instance: Optional[Simulator] = None
     num_instances = 0
 
@@ -102,7 +99,7 @@ class Simulator:
     def schedule_event(cls, time_at: float, action: Callable[[], None], e_type: EventType) -> int:
         """Schedules an event at a specific simulation time.
 
-        :param time: Time at which the event occur
+        :param time_at: Time at which the event occur
         :param action: Function to be executed
         :param e_type: Type of the event
         :return: Unique identifier for the event
@@ -149,7 +146,10 @@ class Simulator:
 
     @classmethod
     def run(cls, number_of_events: int):
-        """Starts the simulation loop."""
+        """Starts the simulation loop.
+
+        :param number_of_events: Number of events to process
+        """
         instance = cls.get_instance()
 
         while not instance.event_queue.empty() and instance.processed_events < number_of_events:
@@ -168,10 +168,10 @@ class Simulator:
                 instance.processed_events += 1
 
         if instance.event_queue.empty():
-            logger.warning("%s Simulation ended: empty event queue", instance.get_current_time())
+            logger.warning("%4.5f Simulation ended: empty event queue", instance.get_current_time())
         else:
             logger.info(
-                "%s Simulation ended: processed %s events",
+                "%4.5f Simulation ended: processed %s events",
                 instance.get_current_time(),
                 instance.processed_events,
             )
@@ -197,13 +197,14 @@ class Simulator:
         self.processed_events: int = 0
 
     def _get_next_id(self):
+        """Return the next unique event identifier."""
         new_id = self.event_id_counter
         self.event_id_counter += 1
         return new_id
 
 
 class Request:
-    """Class for requests in the network.d"""
+    """Class for requests in the network."""
 
     next_req_id = 0
 
@@ -214,32 +215,32 @@ class Request:
         total_size: float,
         min_resources: int,
     ):
-        """Initialize a request.
-
-        :param flow_id: Unique identifier of flow created the request
-        :param arrival_time: Time at which the request is generated
-        :param min_resources: Minimum resources required to serve the request
-        :param service_event_id: Unique identifier for the service event
-        :param total_size: Total size of the request [resource_units * time]
-        :param served_size: Already served size of the request
-        :param last_alloc_time: Time at which the last resource allocation is made
-        :param current_alloc_resource: Current resource allocation
-        :param end_service_time: Time at which the request is served
         """
+        Initialize a request.
+
+        :param flow_id: Unique identifier of the flow that created the request.
+        :param arrival_time: Time at which the request is generated.
+        :param total_size: Total size of the request in resource units * time.
+        :param min_resources: Minimum resources required to serve the request.
+        """
+        # Unique identifier of the request
         self.request_id: int = self.__class__.next_req_id
         self.__class__.next_req_id += 1
 
         self.flow_id: int = flow_id
         self.arrival_time: float = arrival_time
-        # TBD: remove according to logic?
-        self.min_resources: int = min_resources
-        self.service_event_id: Optional[int] = None
-
         self.total_size: float = total_size
-        self.served_size: float = 0
+        self.min_resources: int = min_resources
 
+        # Identifier for the service event
+        self.service_event_id: Optional[int] = None
+        # Size of the request that has been served so far
+        self.served_size: float = 0
+        # Time of the last resource allocation
         self.last_alloc_time: float = self.arrival_time
+        # Current resource allocation for the request
         self.current_alloc_resource: int = 0
+        # Time at which the request service is completed
         self.end_service_time: float = 0.0
 
     def __str__(self) -> str:
@@ -271,6 +272,7 @@ class Request:
 
     def realloc_resources(self, new_alloc_resources: int) -> float:
         """Reallocate resources for the request and return the remaining service time.
+
         :param new_alloc_resources: New resource allocation for the request
         :return: Remaining service time for the request
         """
@@ -419,14 +421,12 @@ class Flow(StatsBaseClass, ABC):
         service_time = req.end_service_time - req.arrival_time
 
         # recursive mean:
-        self.request_service_time = (
-            self.total_serviced_requests * self.request_service_time + service_time
-        ) / (self.total_serviced_requests + 1)
+        total = self.total_serviced_requests
+        self.request_service_time = (total * self.request_service_time + service_time) / (total + 1)
 
         self.request_mean_resources = (
-            self.total_serviced_requests * self.request_mean_resources
-            + req.total_size / service_time
-        ) / (self.total_serviced_requests + 1)
+            total * self.request_mean_resources + req.total_size / service_time
+        ) / (total + 1)
 
         self.total_serviced_requests += 1
 
@@ -506,8 +506,11 @@ class Network(StatsBaseClass):
         self.requests_lookup: dict[int, Request] = {}
         self.flows_lookup: dict[int, Flow] = {}
 
-        # some stats
+        # Statistics
+
+        # statistics collection start time
         self.stats_start_time = 0
+        # last time statistics were updated
         self.last_stats_update = 0
         # allocated_resources * time
         self.mean_utilization = 0
@@ -529,13 +532,13 @@ class Network(StatsBaseClass):
         """Return the statistics collected for the network."""
 
         # average over simulation time
-        time_at = Simulator.get_current_time() - self.stats_start_time
-        mean_utilization = self.mean_utilization / time_at
+        duration = Simulator.get_current_time() - self.stats_start_time
+        mean_utilization = self.mean_utilization / duration
         mean_flow_reqs_in_service = {
-            flow_id: val / time_at for flow_id, val in self.mean_flow_reqs_in_service.items()
+            flow_id: val / duration for flow_id, val in self.mean_flow_reqs_in_service.items()
         }
         mean_flow_res_in_service = {
-            flow_id: val / time_at for flow_id, val in self.mean_flow_res_in_service.items()
+            flow_id: val / duration for flow_id, val in self.mean_flow_res_in_service.items()
         }
 
         return {
@@ -569,42 +572,42 @@ class Network(StatsBaseClass):
             self.mean_flow_res_in_service[flow_id] += duration * flow_res_in_service[flow_id]
 
         self.mean_utilization += duration * utilization
-
         self.last_stats_update = current_time
 
     def add_flows(self, n_real_time_flows: int, n_elastic_flows: int):
-        """Add real-time data and elastic data flows to the network."""
+        """Add real-time data and elastic data flows to the network.
+        Only one elastic data flow is supported.
+        """
+        if n_real_time_flows < 0 or n_elastic_flows != 1:
+            logger.error(
+                "Incorrect number of flows: rt flows = %s, data flows = %s",
+                n_real_time_flows,
+                n_elastic_flows,
+            )
         flow_id = 0
 
         for i in range(n_real_time_flows):
-            flow = RealTimeFlow(
+            self.flows_lookup[flow_id] = RealTimeFlow(
                 flow_id,
                 self.params.real_time_lambdas[i],
                 self.params.real_time_mus[i],
                 self.params.real_time_resources[i],
             )
-            self.flows_lookup[flow_id] = flow
             flow_id += 1
 
         for _ in range(n_elastic_flows):
-            flow = ElasticDataFlow(
+            self.flows_lookup[flow_id] = ElasticDataFlow(
                 flow_id,
                 self.params.data_lambda,
                 self.params.data_mu,
                 (self.params.data_resources_min, self.params.data_resources_max),
             )
-            self.flows_lookup[flow_id] = flow
             flow_id += 1
 
-        if n_real_time_flows + n_elastic_flows != len(self.flows_lookup):
-            logger.error(
-                "Flows not added correctly: rt flows = %s, data flows = %s, total = %s",
-                n_real_time_flows,
-                n_elastic_flows,
-                len(self.flows_lookup),
-            )
+        assert n_real_time_flows + n_elastic_flows == len(self.flows_lookup)
+        logger.info("Created flows: RT = %s, Data = %s", n_real_time_flows, n_elastic_flows)
 
-        for _, flow in self.flows_lookup.items():
+        for flow in self.flows_lookup.values():
             flow.set_on_arrival_callback(self.request_arrival_handler)
             flow.start_flow()
 
@@ -643,6 +646,7 @@ class Network(StatsBaseClass):
         self.redistribute_elastic_resources()
 
     def _log_str_with_distr(self, mark: str = ""):
+        """Return a string representation of resource distibution in the network."""
         str_start = f"{Simulator.get_current_time():4.5f} Distribution [{mark}]:\n"
 
         for _, req in self.requests_lookup.items():
@@ -655,7 +659,7 @@ class Network(StatsBaseClass):
         return str_start
 
     def redistribute_elastic_resources(self):
-        """Dynamically adjust resource allocation among elastic requests."""
+        """Adjust resource allocation among elastic requests."""
         self.update_utilization_stats()
 
         min_required_resources = sum(req.min_resources for req in self.requests_lookup.values())
@@ -730,6 +734,7 @@ class Network(StatsBaseClass):
         logger.debug(self._log_str_with_distr("new"))
 
     def request_service_handler(self, req_id: int):
+        """Handle the service completion of request."""
         self.update_utilization_stats()
         req = self.requests_lookup[req_id]
         req.end_service_time = Simulator.get_current_time()
@@ -753,6 +758,7 @@ class Network(StatsBaseClass):
 
 
 def convert_stats_to_metrics(params: ParametersSet, network: Network):
+    """Convert network statistics to metrics."""
     net_stats = network.get_stats()
     n_rt_flows = params.real_time_flows
 
@@ -791,37 +797,137 @@ def convert_stats_to_metrics(params: ParametersSet, network: Network):
     return metrics
 
 
-random.seed(1)
-test_params = ParametersSet(2, [15, 3], [1, 1], [1, 5], 1, 50, 1, 1, 50)
-test_params = ParametersSet(1, [3], [1], [5], 1, 50, 1, 1, 50)
+def get_argparser():
+    """Return the argument parser."""
+    parser = argparse.ArgumentParser(
+        description="Satellite network simulation: n real-time flows, 1 elastic data flow"
+    )
 
-test_params = ParametersSet(1, [0.042], [1 / 300], [3], 1, 5, 4.2, 1 / 16, 50)
+    # Real-time flow parameters
+    parser.add_argument(
+        "--real_time_flows",
+        type=int,
+        default=2,
+        help="Number of real-time data flows in the network",
+    )
+    parser.add_argument(
+        "--real_time_lambdas",
+        type=float,
+        nargs="+",
+        default=[15.0, 3.0],
+        help="Arrival rates (lambda) for real-time data flows (space-separated list)",
+    )
+    parser.add_argument(
+        "--real_time_mus",
+        type=float,
+        nargs="+",
+        default=[0.2, 0.2],
+        help="Service rates (mu) for real-time data flows (space-separated list)",
+    )
+    parser.add_argument(
+        "--real_time_resources",
+        type=int,
+        nargs="+",
+        default=[1, 5],
+        help="Resource units required by each real-time flow (space-separated list)",
+    )
 
-simulator = Simulator.get_instance()
-network = Network(test_params)
-network.add_flows(1, 1)
+    # Elastic data flow parameters
+    parser.add_argument(
+        "--data_resources_min",
+        type=int,
+        default=1,
+        help="Minimum resource units allocated for elastic data flow",
+    )
+    parser.add_argument(
+        "--data_resources_max",
+        type=int,
+        default=10,
+        help="Maximum resource units allocated for elastic data flow",
+    )
+    parser.add_argument(
+        "--data_lambda",
+        type=float,
+        default=2.5,
+        help="Arrival rate (lambda) for elastic data flow",
+    )
+    parser.add_argument(
+        "--data_mu",
+        type=float,
+        default=1.0,
+        help="Service rate (mu) for elastic data flow",
+    )
 
-time_start = time.time()
-simulator.run(100000)
-time_run_1 = time.time()
+    # Beam capacity parameter
+    parser.add_argument(
+        "--beam_capacity",
+        type=int,
+        default=100,
+        help="Total beam capacity in resource units",
+    )
 
-print(f"w/o stats: {time_run_1 - time_start:5.3f}")
+    # Simulation parameters
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=1000,
+        help="Number of events to run before starting statistics collection",
+    )
+    parser.add_argument(
+        "--events",
+        type=int,
+        default=10000,
+        help="Total number of events to simulate",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for simulation reproducibility",
+    )
+
+    return parser
 
 
-network.enable_stats_collection()
-for flow in network.flows_lookup.values():
-    flow.enable_stats_collection()
+if __name__ == "__main__":
+    parser = get_argparser()
+    args = parser.parse_args()
 
-time_start = time.time()
-simulator.run(50000 * 20)
-time_run_2 = time.time()
+    random.seed(args.seed)
+    params = ParametersSet(
+        real_time_flows=args.real_time_flows,
+        real_time_lambdas=args.real_time_lambdas,
+        real_time_mus=args.real_time_mus,
+        real_time_resources=args.real_time_resources,
+        data_resources_min=args.data_resources_min,
+        data_resources_max=args.data_resources_max,
+        data_lambda=args.data_lambda,
+        data_mu=args.data_mu,
+        beam_capacity=args.beam_capacity,
+    )
 
-print(f"with stats: {time_run_2 - time_start:5.3f}")
+    params = ParametersSet(1, [0.042], [1 / 300], [3], 1, 5, 4.2, 1 / 16, 50)
 
-print(network.get_stats())
-for flow in network.flows_lookup.values():
-    print(flow.get_stats())
+    simulator = Simulator.get_instance()
+    network = Network(params)
+    network.add_flows(n_real_time_flows=params.real_time_flows, n_elastic_flows=1)
 
+    warmup_start_time = time.time()
+    simulator.run(args.warmup)
+    warmup_finish_time = time.time()
 
-metrics = convert_stats_to_metrics(test_params, network)
-print(metrics)
+    logger.info("Warmup time: %4.5f", warmup_finish_time - warmup_start_time)
+
+    # start statistics collection
+    network.enable_stats_collection()
+    for flow in network.flows_lookup.values():
+        flow.enable_stats_collection()
+
+    time_start = time.time()
+    simulator.run(args.warmup + args.events)
+    time_finish = time.time()
+
+    logger.info("Simulation time: %4.5f", time_finish - time_start)
+
+    metrics = convert_stats_to_metrics(params, network)
+    logger.info("%s", metrics)
