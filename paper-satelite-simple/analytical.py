@@ -6,6 +6,7 @@ import argparse
 import logging
 import itertools
 import time
+from dataclasses import dataclass
 import numpy as np
 from utils import ParametersSet, Metrics
 
@@ -16,20 +17,24 @@ logging.basicConfig(filename="analytical.log", filemode="w", level=logging.INFO,
 class Solver:
     """Analytical model for the satellite communication system with real-time and data flows."""
 
+    @dataclass(frozen=True)
     class State:
-        """State of the markov process. Helper class."""
+        """State of the markov process"""
 
-        def __init__(self, i_vec: list[int], d: int):
-            self.i_vec = i_vec
-            self.d = d
+        i_vec: tuple[int, ...]
+        d: int
 
-        def ik_(self, k, delta=1):
-            i_vec = self.i_vec.copy()
+        def ik_(self, k: int, delta=1):
+            i_vec = list(self.i_vec)
             i_vec[k] += delta
-            return Solver.State(i_vec, self.d)
+            return Solver.State(tuple(i_vec), self.d)
 
         def d_(self, delta=1):
             return Solver.State(self.i_vec, self.d + delta)
+
+        def __hash__(self):
+            # Combine the hash of both fields for a unique hash value
+            return hash((self.i_vec, self.d))
 
     def __init__(self, params: ParametersSet, max_eps: float, max_iter: int):
         """Initialize the solver
@@ -44,11 +49,13 @@ class Solver:
 
         logger.info("%s", self.params)
 
-        self.states: dict[tuple, float] = {state: 1.0 for state in self.get_possible_states()}
+        self.states: dict[Solver.State, float] = {
+            state: 1e-2 for state in self.get_possible_states()
+        }
 
         logger.info("Number of states: %d", len(self.states))
 
-    def get_possible_states(self) -> list[tuple]:
+    def get_possible_states(self) -> list[State]:
         """Get possible states for markov process."""
         beam_capacity = self.params.beam_capacity
         b_min = self.params.data_resources_min
@@ -64,7 +71,7 @@ class Solver:
         states = itertools.product(*real_time_flows_states, data_flow_states)
         # filter by capacity
         states_lst = [
-            s
+            Solver.State(s[:-1], s[-1])
             for s in states
             if np.dot(s[:-1], self.params.real_time_resources) + s[-1] * b_min <= beam_capacity
         ]
@@ -74,9 +81,9 @@ class Solver:
     def solve(self):
         """Solve the model."""
         n = self.params.real_time_flows
-        lamb = self.params.real_time_lambdas
-        mu = self.params.real_time_mus
-        b = self.params.real_time_resources
+        lamb = np.array(self.params.real_time_lambdas)
+        mu = np.array(self.params.real_time_mus)
+        b = np.array(self.params.real_time_resources)
 
         b_min = self.params.data_resources_min
         b_max = self.params.data_resources_max
@@ -85,50 +92,50 @@ class Solver:
 
         v = self.params.beam_capacity
 
+        flows_idx = list(range(n))
+
         error = 1000
         iteration = 0
 
         logger.info("Start solving the model")
         start_time = time.time()
-        while not (error < self.max_eps or iteration > self.max_iter):
+        while error > self.max_eps and iteration < self.max_iter:
             iteration += 1
             error = 0
 
-            for state in self.states.keys():
-                *i_vec, d = state
-
-                state_ = Solver.State(i_vec, d)
+            for st, prev_prob in self.states.items():
+                i_vec, d = st.i_vec, st.d
+                i_vec = np.array(i_vec)
 
                 l = np.dot(i_vec, b)
                 l_tot = l + d * b_min
-                d_lim = (v - l) // b_max
 
                 real_time_arrival_d = sum(lamb[k] * (l_tot + b[k] <= v) for k in range(n))
                 real_time_serv_d = sum(i_vec[k] * mu[k] * (i_vec[k] > 0) for k in range(n))
 
                 data_arr_d = lambda_e * (l_tot + b_min <= v)
-                data_serv_d = mu_e * (d > 0) * ((v - l) * (d > d_lim) + d * b_max * (d <= d_lim))
+                data_serv_d = mu_e * (d > 0) * min(v - l, d * b_max)
 
                 denr = real_time_arrival_d + real_time_serv_d + data_arr_d + data_serv_d
 
                 real_time_arr_n = sum(
-                    self.prob(state_.ik_(k, -1)) * lamb[k] * (i_vec[k] > 0) for k in range(n)
+                    self.states.get(st.ik_(k, -1), 0) * lamb[k] * (i_vec[k] > 0) for k in flows_idx
                 )
                 real_time_serv_n = sum(
-                    self.prob(state_.ik_(k, +1)) * (i_vec[k] + 1) * mu[k] * (l_tot + b[k] <= v)
+                    self.states.get(st.ik_(k, +1), 0) * (i_vec[k] + 1) * mu[k] * (l_tot + b[k] <= v)
                     for k in range(n)
                 )
-                data_arr_n = self.prob(state_.d_(-1)) * lambda_e * (l_tot <= v and d > 0)
+                data_arr_n = self.states.get(st.d_(-1), 0) * lambda_e * (l_tot <= v and d > 0)
                 data_serv_n = (
-                    self.prob(state_.d_(+1))
+                    self.states.get(st.d_(+1), 0.0)
                     * (l_tot + b_min <= v and d + 1 > 0)
                     * mu_e
-                    * ((v - l) * (d + 1 > d_lim) + (d + 1) * b_max * (d + 1 <= d_lim))
+                    * min(v - l, b_max * (d + 1))
                 )
 
                 numr = real_time_arr_n + real_time_serv_n + data_arr_n + data_serv_n
-                error += (self.states[state] - numr / denr) / self.states[state]
-                self.states[state] = numr / denr
+                error += (prev_prob - numr / denr) / prev_prob
+                self.states[st] = numr / denr
 
             if iteration % 500 == 0:
                 # use lazy formatting
@@ -150,15 +157,9 @@ class Solver:
         metrics = self.calculate_metrics()
         logger.info("%s", metrics)
 
-        # self.check_solution(metrics)
+        self.check_solution(metrics)
 
         return metrics, iteration, error
-
-    def prob(self, state: Solver.State):
-        """Get probability of the state."""
-        st = (*state.i_vec, state.d)
-
-        return self.states[st] if (st in self.states) else 0
 
     def calculate_metrics(self) -> Metrics:
         """Calculate metrics for the model."""
@@ -166,13 +167,13 @@ class Solver:
         rt_flows = self.params.real_time_flows
 
         metrics = Metrics(
-            rt_request_rej_prob=[0] * rt_flows,
-            mean_rt_requests_in_service=[0] * rt_flows,
-            mean_resources_per_rt_flow=[0] * rt_flows,
+            rt_request_rej_prob=[0]*rt_flows,
+            mean_rt_requests_in_service=[0]*rt_flows,
+            mean_resources_per_rt_flow=[0]*rt_flows,
         )
 
         for state in self.states.keys():
-            *i_vec, d = state
+            i_vec, d = state.i_vec, state.d
             b_min = self.params.data_resources_min
 
             v = self.params.beam_capacity
@@ -189,11 +190,8 @@ class Solver:
                 metrics.data_request_rej_prob += self.states[state]
 
             b_max = self.params.data_resources_max
-            d_limit = (v - np.dot(i_vec, self.params.real_time_resources)) // b_max
-            data_res = (v - np.dot(i_vec, self.params.real_time_resources)) * (
-                d > d_limit
-            ) + d * b_max * (d <= d_limit) * (d > 0)
-            metrics.mean_resources_per_data_flow += data_res * self.states[state]
+            data_res = min(v - np.dot(i_vec, self.params.real_time_resources), d * b_max)
+            metrics.mean_resources_per_data_flow += (d > 0) * data_res * self.states[state]
             metrics.mean_data_requests_in_service += d * self.states[state]
 
         for k in range(rt_flows):
@@ -222,8 +220,9 @@ class Solver:
         pi_e = metrics.data_request_rej_prob
         mu_e = self.params.data_mu
         m_e = metrics.mean_resources_per_data_flow
+        b_min = self.params.data_resources_min
 
-        logger.info("Data flow balance: %s", np.isclose(lambda_e * (1 - pi_e), m_e * mu_e))
+        logger.info("Data flow balance: %s", np.isclose(lambda_e * (1 - pi_e) * b_min, m_e * mu_e))
 
         # real-time traffic flows
         for k in range(self.params.real_time_flows):
@@ -326,8 +325,6 @@ def get_argparser():
 
     return parser
 
-
-# the same as in file simulation.py
 
 if __name__ == "__main__":
     parser = get_argparser()
