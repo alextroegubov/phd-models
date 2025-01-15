@@ -114,7 +114,7 @@ class Solver:
                 real_time_serv_d = sum(i_vec[k] * mu[k] * (i_vec[k] > 0) for k in range(n))
 
                 data_arr_d = lambda_e * (l_tot + b_min <= v)
-                data_serv_d = mu_e * (d > 0) * min(v - l, d * b_max)
+                data_serv_d = mu_e / b_min * (d > 0) * min(v - l, d * b_max)
 
                 denr = real_time_arrival_d + real_time_serv_d + data_arr_d + data_serv_d
 
@@ -130,6 +130,7 @@ class Solver:
                     self.states.get(st.d_(+1), 0.0)
                     * (l_tot + b_min <= v and d + 1 > 0)
                     * mu_e
+                    / b_min
                     * min(v - l, b_max * (d + 1))
                 )
 
@@ -167,9 +168,9 @@ class Solver:
         rt_flows = self.params.real_time_flows
 
         metrics = Metrics(
-            rt_request_rej_prob=[0]*rt_flows,
-            mean_rt_requests_in_service=[0]*rt_flows,
-            mean_resources_per_rt_flow=[0]*rt_flows,
+            rt_request_rej_prob=[0] * rt_flows,
+            mean_rt_requests_in_service=[0] * rt_flows,
+            mean_resources_per_rt_flow=[0] * rt_flows,
         )
 
         for state in self.states.keys():
@@ -222,7 +223,9 @@ class Solver:
         m_e = metrics.mean_resources_per_data_flow
         b_min = self.params.data_resources_min
 
-        logger.info("Data flow balance: %s", np.isclose(lambda_e * (1 - pi_e) * b_min, m_e * mu_e))
+        logger.info(
+            "Data flow balance: %s", np.isclose(lambda_e * (1 - pi_e) * b_min, m_e * mu_e)
+        )
 
         # real-time traffic flows
         for k in range(self.params.real_time_flows):
