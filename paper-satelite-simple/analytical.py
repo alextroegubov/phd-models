@@ -135,7 +135,7 @@ class Solver:
                 )
 
                 numr = real_time_arr_n + real_time_serv_n + data_arr_n + data_serv_n
-                error += (prev_prob - numr / denr) / prev_prob
+                error += abs(prev_prob - numr / denr) / prev_prob
                 self.states[st] = numr / denr
 
             if iteration % 500 == 0:
@@ -348,3 +348,5 @@ if __name__ == "__main__":
     # params = ParametersSet(1, [0.042], [1 / 300], [3], 1, 5, 4.2, 1 / 16, 50)
     solver = Solver(params, args.max_error, args.max_iter)
     metrics, it, error = solver.solve()
+
+    print(metrics)
