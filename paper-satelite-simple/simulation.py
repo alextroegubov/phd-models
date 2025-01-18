@@ -766,33 +766,40 @@ def convert_stats_to_metrics(params: ParametersSet, network: Network):
         flow_id: network.flows_lookup[flow_id].get_stats() for flow_id in network.flows_lookup
     }
 
+    has_ed= any(isinstance(flow, ElasticDataFlow) for flow in network.flows_lookup.values())
+    has_rt = any(isinstance(flow, RealTimeFlow) for flow in network.flows_lookup.values())
+
     metrics = Metrics(
         rt_request_rej_prob=[0] * n_rt_flows,
         mean_rt_requests_in_service=[0] * n_rt_flows,
         mean_resources_per_rt_flow=[0] * n_rt_flows,
     )
 
-    for i in range(n_rt_flows):
-        stats = flows_stats[i]
+    if has_rt:
+        for i in range(n_rt_flows):
+            stats = flows_stats[i]
 
-        metrics.rt_request_rej_prob[i] = (
-            stats["total_rejected_requests"] / stats["total_gen_requests"]
+            metrics.rt_request_rej_prob[i] = (
+                stats["total_rejected_requests"] / stats["total_gen_requests"]
+            )
+
+            metrics.mean_rt_requests_in_service[i] = net_stats["mean_flow_reqs_in_service"][i]
+
+            metrics.mean_resources_per_rt_flow[i] = net_stats["mean_flow_res_in_service"][i]
+
+    if has_ed:
+        key = n_rt_flows if has_rt else 0
+        ed_stats = flows_stats[key]
+        metrics.data_request_rej_prob = (
+            ed_stats["total_rejected_requests"] / ed_stats["total_gen_requests"]
         )
 
-        metrics.mean_rt_requests_in_service[i] = net_stats["mean_flow_reqs_in_service"][i]
+        metrics.mean_data_request_service_time = ed_stats["request_service_time"]
+        metrics.mean_resources_per_data_request = ed_stats["request_mean_resources"]
+        metrics.mean_data_requests_in_service = net_stats["mean_flow_reqs_in_service"][key]
+        metrics.mean_resources_per_data_flow = net_stats["mean_flow_res_in_service"][key]
 
-        metrics.mean_resources_per_rt_flow[i] = net_stats["mean_flow_res_in_service"][i]
-
-    ed_stats = flows_stats[n_rt_flows]
     metrics.beam_utilization = net_stats["mean_utilization"]
-    metrics.data_request_rej_prob = (
-        ed_stats["total_rejected_requests"] / ed_stats["total_gen_requests"]
-    )
-
-    metrics.mean_data_request_service_time = ed_stats["request_service_time"]
-    metrics.mean_resources_per_data_request = ed_stats["request_mean_resources"]
-    metrics.mean_data_requests_in_service = net_stats["mean_flow_reqs_in_service"][n_rt_flows]
-    metrics.mean_resources_per_data_flow = net_stats["mean_flow_res_in_service"][n_rt_flows]
 
     return metrics
 
@@ -865,6 +872,13 @@ def get_argparser():
         default=100,
         help="Total beam capacity in resource units",
     )
+    # Has elastic data flow
+    parser.add_argument(
+        "--elastic_data_flow",
+        action="store_true",
+        default=False,
+        help="Flag to include elastic data flow in the network",
+    )
 
     # Simulation parameters
     parser.add_argument(
@@ -906,11 +920,10 @@ if __name__ == "__main__":
         beam_capacity=args.beam_capacity,
     )
 
-    params = ParametersSet(1, [0.042], [1 / 300], [3], 1, 5, 4.2, 1 / 16, 50)
-
     simulator = Simulator.get_instance()
     network = Network(params)
-    network.add_flows(n_real_time_flows=params.real_time_flows, n_elastic_flows=1)
+    network.add_flows(n_real_time_flows=params.real_time_flows, 
+                      n_elastic_flows=int(args.elastic_data_flow))
 
     warmup_start_time = time.time()
     simulator.run(args.warmup)
@@ -931,3 +944,5 @@ if __name__ == "__main__":
 
     metrics = convert_stats_to_metrics(params, network)
     logger.info("%s", metrics)
+
+    print(metrics)
