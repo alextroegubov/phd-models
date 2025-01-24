@@ -197,7 +197,8 @@ class SolveApprox:
             y_2 += p[l] * y_e
             W_2 += p[l] * w
 
-        return pi_e_1, y_2, W_2
+        b_e_2 = b_min / (mu_e * W_2)
+        return pi_e_1, y_2, W_2, b_e_2
 
 
 def get_argparser():
@@ -295,8 +296,8 @@ if __name__ == "__main__":
 
     approx = SolveApprox(params)
 
-    pi_e_1, y_2, W_2 = approx.solve()
+    pi_e_1, y_2, W_2, b_e_2 = approx.solve()
 
     logger.info("%s", str(metrics_rt))
     logger.info("%s", str(metrics_data))
-    logger.info("%s", f"{pi_e_1=}, {y_2=}, {W_2=}")
+    logger.info("%s", f"{pi_e_1=}, {y_2=}, {W_2=}, {b_e_2=}")
