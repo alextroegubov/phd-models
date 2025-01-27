@@ -17,7 +17,7 @@ import numpy as np
 from utils import ParametersSet, Metrics
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(filename="simulation.log", filemode="w", level=logging.INFO, encoding="utf-8")
+logging.basicConfig(filename="simulation.log", filemode="w", level=logging.DEBUG, encoding="utf-8")
 
 
 class StatsBaseClass(ABC):
@@ -349,7 +349,7 @@ class Flow(StatsBaseClass, ABC):
         """Generates the time until the next request using exponential distribution."""
         return random.expovariate(self.arrival_rate)  # 1 / (1 / arrival_intensity)
 
-    def generate_request(self):
+    def _generate_request(self):
         """Generates a new request and schedules the next request arrival."""
         size = self._generate_service_time() * self._get_min_resources()
         req = Request(
@@ -368,7 +368,11 @@ class Flow(StatsBaseClass, ABC):
         else:
             assert False, "callback not set"
             # add log that on_arrival_callback not set
-        self._schedule_request()
+
+    @abstractmethod
+    def generate_request(self):
+        """Generates a new request and schedules the next request arrival."""
+        raise NotImplementedError
 
     def _schedule_request(self):
         """Schedules the request arrival event."""
@@ -465,6 +469,10 @@ class RealTimeFlow(Flow):
         """Generates the service time using exponential distribution."""
         return random.expovariate(self.service_rate)
 
+    def generate_request(self):
+        """Generates a new request and schedules the next request arrival."""
+        self._generate_request()
+        self._schedule_request()
 
 class ElasticDataFlow(Flow):
     """Class for elastic data flows in the network."""
@@ -475,9 +483,15 @@ class ElasticDataFlow(Flow):
         arrival_rate: float,
         service_rate: float,
         min_max_resources_range: tuple[int, int],
+        requests_batch_probs: list[float],
     ):
         super().__init__(flow_id, arrival_rate, service_rate)
         self.min_resources, self.max_resources = min_max_resources_range
+        self.requests_batch_probs = requests_batch_probs
+
+        # specific to elastic data stats
+        self.total_batches = 0
+        self.requests_per_batch = 0
 
     def get_max_resources(self) -> int:
         """Return maximum amount of resources to serve the request"""
@@ -490,6 +504,39 @@ class ElasticDataFlow(Flow):
     def _generate_service_time(self) -> float:
         """Generates the service time using exponential distribution."""
         return random.expovariate(self.service_rate)
+
+    def generate_request(self):
+        """Generate a batch of requests."""
+        batch_size = random.choices(
+            population=np.arange(1, len(self.requests_batch_probs) + 1, dtype=int),
+            weights=self.requests_batch_probs,
+        )[0]
+
+        logger.debug(
+            "%4.5f Flow[id=%s]: generate a batch of requests %d",
+            Simulator.get_current_time(),
+            self.flow_id,
+            batch_size,
+        )
+
+        self.batch_generated(batch_size)
+
+        for _ in range(batch_size):
+            self._generate_request()
+        self._schedule_request()
+
+    @StatsBaseClass.if_stats_enabled
+    def batch_generated(self, batch_size):
+        """Increments the number of generated batches."""
+        total = self.total_batches
+        self.requests_per_batch = (total * self.requests_per_batch + batch_size) / (total + 1)
+        self.total_batches += 1
+
+    def get_stats(self):
+        general_stats = super().get_stats()
+        general_stats['mean_requests_per_batch'] = self.requests_per_batch
+
+        return general_stats
 
 
 class Network(StatsBaseClass):
@@ -601,6 +648,7 @@ class Network(StatsBaseClass):
                 self.params.data_lambda,
                 self.params.data_mu,
                 (self.params.data_resources_min, self.params.data_resources_max),
+                self.params.data_requests_batch_probs,
             )
             flow_id += 1
 
@@ -766,7 +814,7 @@ def convert_stats_to_metrics(params: ParametersSet, network: Network):
         flow_id: network.flows_lookup[flow_id].get_stats() for flow_id in network.flows_lookup
     }
 
-    has_ed= any(isinstance(flow, ElasticDataFlow) for flow in network.flows_lookup.values())
+    has_ed = any(isinstance(flow, ElasticDataFlow) for flow in network.flows_lookup.values())
     has_rt = any(isinstance(flow, RealTimeFlow) for flow in network.flows_lookup.values())
 
     metrics = Metrics(
@@ -798,6 +846,7 @@ def convert_stats_to_metrics(params: ParametersSet, network: Network):
         metrics.mean_resources_per_data_request = ed_stats["request_mean_resources"]
         metrics.mean_data_requests_in_service = net_stats["mean_flow_reqs_in_service"][key]
         metrics.mean_resources_per_data_flow = net_stats["mean_flow_res_in_service"][key]
+        metrics.mean_data_requests_per_batch = ed_stats["mean_requests_per_batch"]
 
     metrics.beam_utilization = net_stats["mean_utilization"]
 
@@ -864,7 +913,13 @@ def get_argparser():
         default=1.0,
         help="Service rate (mu) for elastic data flow",
     )
-
+    parser.add_argument(
+        "--data_requests_batch_probs",
+        type=float,
+        nargs="+",
+        default=[1/3, 1/3, 1/3],
+        help="Batch probs f_s, s = 1, ..., B",
+    )
     # Beam capacity parameter
     parser.add_argument(
         "--beam_capacity",
@@ -917,13 +972,15 @@ if __name__ == "__main__":
         data_resources_max=args.data_resources_max,
         data_lambda=args.data_lambda,
         data_mu=args.data_mu,
+        data_requests_batch_probs=args.data_requests_batch_probs,
         beam_capacity=args.beam_capacity,
     )
 
     simulator = Simulator.get_instance()
     network = Network(params)
-    network.add_flows(n_real_time_flows=params.real_time_flows, 
-                      n_elastic_flows=int(args.elastic_data_flow))
+    network.add_flows(
+        n_real_time_flows=params.real_time_flows, n_elastic_flows=int(args.elastic_data_flow)
+    )
 
     warmup_start_time = time.time()
     simulator.run(args.warmup)

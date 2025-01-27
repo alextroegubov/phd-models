@@ -12,10 +12,14 @@ class ParametersSet:
     data_resources_max: int
     data_lambda: float
     data_mu: float
+    data_requests_batch_probs: list[float]
 
     beam_capacity: int
 
     def __str__(self) -> str:
+
+        def f_lst_4f(lst):
+            return ", ".join(f"{x:.4f}" for x in lst) if lst else "[]"
 
         rt_gen = zip(self.real_time_lambdas, self.real_time_mus, self.real_time_resources)
         real_time_params = "\n".join(
@@ -32,6 +36,7 @@ class ParametersSet:
             f"    b_min = {self.data_resources_min}\n"
             f"    b_max = {self.data_resources_max}\n"
             f"    λ = {self.data_lambda:.5f}, μ = {self.data_mu:.5f}"
+            f"    f = {f_lst_4f(self.requests_batch_probs)}"
         )
 
 
@@ -53,6 +58,9 @@ class Metrics:
     mean_data_request_service_time: float = 0
     # b_e
     mean_resources_per_data_request: float = 0
+
+    # d_s
+    mean_data_requests_per_batch: float = 0
 
     beam_utilization: float = 0
 
@@ -80,4 +88,5 @@ class Metrics:
             f"      Mean resources per flow     : {self.mean_resources_per_data_flow:.4f}\n"
             f"      Mean resources per request  : {self.mean_resources_per_data_request:.4f}\n"
             f"      Mean request service time   : {self.mean_data_request_service_time:.4f}\n"
+            f"      Mean requests per batch     : {self.mean_data_requests_per_batch:.4f}\n"
         )
