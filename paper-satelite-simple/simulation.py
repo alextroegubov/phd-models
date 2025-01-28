@@ -17,7 +17,7 @@ import numpy as np
 from utils import ParametersSet, Metrics
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(filename="simulation.log", filemode="w", level=logging.DEBUG, encoding="utf-8")
+logging.basicConfig(filename="simulation.log", filemode="w", level=logging.INFO, encoding="utf-8")
 
 
 class StatsBaseClass(ABC):
@@ -339,7 +339,6 @@ class Flow(StatsBaseClass, ABC):
         self.total_rejected_requests = 0
 
         self.request_service_time: float = 0
-        self.request_mean_resources: float = 0
 
     def set_on_arrival_callback(self, fn: Callable[[Request], None]):
         """Set the callback function to be executed when a request arrives."""
@@ -401,7 +400,6 @@ class Flow(StatsBaseClass, ABC):
             "total_serviced_requests": self.total_serviced_requests,
             "total_rejected_requests": self.total_rejected_requests,
             "request_service_time": self.request_service_time,
-            "request_mean_resources": self.request_mean_resources,
         }
 
     @StatsBaseClass.if_stats_enabled
@@ -422,10 +420,6 @@ class Flow(StatsBaseClass, ABC):
         # recursive mean:
         total = self.total_serviced_requests
         self.request_service_time = (total * self.request_service_time + service_time) / (total + 1)
-
-        self.request_mean_resources = (
-            total * self.request_mean_resources + req.total_size / service_time
-        ) / (total + 1)
 
         self.total_serviced_requests += 1
 
@@ -780,7 +774,7 @@ class Network(StatsBaseClass):
                 )
                 req.service_event_id = event_id
 
-        logger.debug(self._log_str_with_distr("new"))
+        logger.debug("%s", self._log_str_with_distr("new"))
 
     def request_service_handler(self, req_id: int):
         """Handle the service completion of request."""
@@ -844,9 +838,9 @@ def convert_stats_to_metrics(params: ParametersSet, network: Network):
         )
 
         metrics.mean_data_request_service_time = ed_stats["request_service_time"]
-        metrics.mean_resources_per_data_request = ed_stats["request_mean_resources"]
         metrics.mean_data_requests_in_service = net_stats["mean_flow_reqs_in_service"][key]
         metrics.mean_resources_per_data_flow = net_stats["mean_flow_res_in_service"][key]
+        metrics.mean_resources_per_data_request = metrics.mean_resources_per_data_flow / metrics.mean_data_requests_in_service
         metrics.mean_data_requests_per_batch = ed_stats["mean_requests_per_batch"]
 
     metrics.beam_utilization = net_stats["mean_utilization"]
