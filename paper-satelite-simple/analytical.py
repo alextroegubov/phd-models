@@ -89,6 +89,8 @@ class Solver:
         b_max = self.params.data_resources_max
         lambda_e = self.params.data_lambda
         mu_e = self.params.data_mu
+        # f[0] = f_1 -> f_s = f[s-1]
+        f = self.params.data_requests_batch_probs
 
         v = self.params.beam_capacity
 
@@ -125,7 +127,10 @@ class Solver:
                     self.states.get(st.ik_(k, +1), 0) * (i_vec[k] + 1) * mu[k] * (l_tot + b[k] <= v)
                     for k in range(n)
                 )
-                data_arr_n = self.states.get(st.d_(-1), 0) * lambda_e * (l_tot <= v and d > 0)
+                data_arr_n = sum(
+                    [self.states.get(st.d_(-s), 0.0) * lambda_e * (f[s-1] * (d - s >= 0) + (v - b_min + 1 <= l_tot <= v) * sum(f[s:]))
+                    for s in range(1, min(d, len(f)) + 1)]
+                )
                 data_serv_n = (
                     self.states.get(st.d_(+1), 0.0)
                     * (l_tot + b_min <= v and d + 1 > 0)
@@ -139,7 +144,6 @@ class Solver:
                 self.states[st] = numr / denr
 
             if iteration % 500 == 0:
-                # use lazy formatting
                 logger.info(
                     "Iteration %d: error = %2.8f, time = %4.2f",
                     iteration,
@@ -173,27 +177,36 @@ class Solver:
             mean_resources_per_rt_flow=[0] * rt_flows,
         )
 
+        b_min = self.params.data_resources_min
+        f = self.params.data_requests_batch_probs
+        v = self.params.beam_capacity
+
+        pi_e_num = 0
+        #d_s
+        mean_batch_size = sum(s * f[s-1] for s in range(1, len(f) + 1))
+
+        metrics.mean_data_requests_per_batch = mean_batch_size
+
         for state in self.states.keys():
             i_vec, d = state.i_vec, state.d
-            b_min = self.params.data_resources_min
-
-            v = self.params.beam_capacity
             l = np.dot(i_vec, self.params.real_time_resources) + b_min * d
 
             for k in range(rt_flows):
                 b_k = self.params.real_time_resources[k]
                 metrics.mean_rt_requests_in_service[k] += i_vec[k] * self.states[state]
 
-                if l + b_k > v:
-                    metrics.rt_request_rej_prob[k] += self.states[state]
+                metrics.rt_request_rej_prob[k] += self.states[state] * (l + b_k > v)
 
-            if l + b_min > v:
-                metrics.data_request_rej_prob += self.states[state]
+            pi_e_num += self.states[state] * sum(
+                f[s-1] * max(s - (v - l) // b_min, 0) for s in range(1, len(f) + 1)
+            )
 
             b_max = self.params.data_resources_max
             data_res = min(v - np.dot(i_vec, self.params.real_time_resources), d * b_max)
             metrics.mean_resources_per_data_flow += (d > 0) * data_res * self.states[state]
             metrics.mean_data_requests_in_service += d * self.states[state]
+
+        metrics.data_request_rej_prob = pi_e_num / mean_batch_size
 
         for k in range(rt_flows):
             metrics.mean_resources_per_rt_flow[k] = (
@@ -205,7 +218,7 @@ class Solver:
         )
 
         metrics.mean_data_request_service_time = metrics.mean_data_requests_in_service / (
-            self.params.data_lambda * 1 * (1 - metrics.data_request_rej_prob)
+            self.params.data_lambda * metrics.mean_data_requests_per_batch * (1 - metrics.data_request_rej_prob)
         )
 
         metrics.beam_utilization = (
@@ -222,9 +235,10 @@ class Solver:
         mu_e = self.params.data_mu
         m_e = metrics.mean_resources_per_data_flow
         b_min = self.params.data_resources_min
+        d_s = metrics.mean_data_requests_per_batch
 
         logger.info(
-            "Data flow balance: %s", np.isclose(lambda_e * (1 - pi_e) * b_min, m_e * mu_e)
+            "Data flow balance: %s", np.isclose(lambda_e * (1 - pi_e) * b_min * d_s, m_e * mu_e)
         )
 
         # real-time traffic flows
@@ -303,6 +317,13 @@ def get_argparser():
         default=1.0,
         help="Service rate (mu) for elastic data flow",
     )
+    parser.add_argument(
+        "--data_requests_batch_probs",
+        type=float,
+        nargs="+",
+        default=[1 / 3, 1 / 3, 1 / 3],
+        help="Batch probs f_s, s = 1, ..., B",
+    )
 
     # Beam capacity parameter
     parser.add_argument(
@@ -329,7 +350,8 @@ def get_argparser():
     return parser
 
 
-if __name__ == "__main__":
+def main():
+    """ Main function. Parses args from command line and runs simulation"""
     parser = get_argparser()
     args = parser.parse_args()
 
@@ -342,11 +364,15 @@ if __name__ == "__main__":
         data_resources_max=args.data_resources_max,
         data_lambda=args.data_lambda,
         data_mu=args.data_mu,
+        data_requests_batch_probs=args.data_requests_batch_probs,
         beam_capacity=args.beam_capacity,
     )
 
-    # params = ParametersSet(1, [0.042], [1 / 300], [3], 1, 5, 4.2, 1 / 16, 50)
     solver = Solver(params, args.max_error, args.max_iter)
     metrics, it, error = solver.solve()
 
     print(metrics)
+
+
+if __name__ == "__main__":
+    main()
