@@ -23,7 +23,7 @@ class ParametersSet:
 
         rt_gen = zip(self.real_time_lambdas, self.real_time_mus, self.real_time_resources)
         real_time_params = "\n".join(
-            f"  Flow {i}:\n\tλ = {lam:.5f},\n\tμ = {mu:.5f},\n\tb = {res}"
+            f"  Flow {i}:\n\t\tλ = {lam:.5f},\n\t\tμ = {mu:.5f},\n\t\tb = {res}"
             for i, (lam, mu, res) in enumerate(rt_gen)
         )
 
@@ -35,8 +35,9 @@ class ParametersSet:
             f"  Elastic Data Flow\n"
             f"    b_min = {self.data_resources_min}\n"
             f"    b_max = {self.data_resources_max}\n"
-            f"    λ = {self.data_lambda:.5f}, μ = {self.data_mu:.5f}"
-            f"    f = {f_lst_4f(self.requests_batch_probs)}"
+            f"    λ = {self.data_lambda:.5f}\n"
+            f"    μ = {self.data_mu:.5f}\n"
+            f"    f = {f_lst_4f(self.data_requests_batch_probs)}"
         )
 
 

@@ -350,7 +350,7 @@ class Flow(StatsBaseClass, ABC):
         return random.expovariate(self.arrival_rate)  # 1 / (1 / arrival_intensity)
 
     def _generate_request(self):
-        """Generates a new request and schedules the next request arrival."""
+        """Generates a single request, updates stats, calls callback."""
         size = self._generate_service_time() * self._get_min_resources()
         req = Request(
             flow_id=self.flow_id,
@@ -368,11 +368,6 @@ class Flow(StatsBaseClass, ABC):
         else:
             assert False, "callback not set"
             # add log that on_arrival_callback not set
-
-    @abstractmethod
-    def generate_request(self):
-        """Generates a new request and schedules the next request arrival."""
-        raise NotImplementedError
 
     def _schedule_request(self):
         """Schedules the request arrival event."""
@@ -440,12 +435,17 @@ class Flow(StatsBaseClass, ABC):
         self.total_gen_requests += 1
 
     @abstractmethod
+    def generate_request(self):
+        """Generates a new request and schedules the next request arrival."""
+        raise NotImplementedError
+
+    @abstractmethod
     def _get_min_resources(self) -> int:
-        pass
+        raise NotImplementedError
 
     @abstractmethod
     def _generate_service_time(self) -> float:
-        pass
+        raise NotImplementedError
 
 
 class RealTimeFlow(Flow):
@@ -473,6 +473,7 @@ class RealTimeFlow(Flow):
         """Generates a new request and schedules the next request arrival."""
         self._generate_request()
         self._schedule_request()
+
 
 class ElasticDataFlow(Flow):
     """Class for elastic data flows in the network."""
@@ -534,7 +535,7 @@ class ElasticDataFlow(Flow):
 
     def get_stats(self):
         general_stats = super().get_stats()
-        general_stats['mean_requests_per_batch'] = self.requests_per_batch
+        general_stats["mean_requests_per_batch"] = self.requests_per_batch
 
         return general_stats
 
@@ -917,7 +918,7 @@ def get_argparser():
         "--data_requests_batch_probs",
         type=float,
         nargs="+",
-        default=[1/3, 1/3, 1/3],
+        default=[1 / 3, 1 / 3, 1 / 3],
         help="Batch probs f_s, s = 1, ..., B",
     )
     # Beam capacity parameter
@@ -958,7 +959,8 @@ def get_argparser():
     return parser
 
 
-if __name__ == "__main__":
+def main():
+    """ Main function. Parses args from command line and runs simulation"""
     parser = get_argparser()
     args = parser.parse_args()
 
@@ -975,6 +977,8 @@ if __name__ == "__main__":
         data_requests_batch_probs=args.data_requests_batch_probs,
         beam_capacity=args.beam_capacity,
     )
+
+    logger.info("%s", params)
 
     simulator = Simulator.get_instance()
     network = Network(params)
@@ -1003,3 +1007,7 @@ if __name__ == "__main__":
     logger.info("%s", metrics)
 
     print(metrics)
+
+
+if __name__ == "__main__":
+    main()
