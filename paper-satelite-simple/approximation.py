@@ -80,8 +80,9 @@ class SolverOnlyRealTime:
 
 class SolverOnlyElasticData:
     """Solver for the elastic data model w/o real-time traffic."""
+
     def __init__(self, params: ParameterSet):
-        self.params = params
+        self.params: ParametersSet = params
         self.p = []
 
     def solve(self):
@@ -93,11 +94,13 @@ class SolverOnlyElasticData:
         mu = self.params.data_mu
         b_min = self.params.data_resources_min
         b_max = self.params.data_resources_max
+        f = self.params.data_requests_batch_probs
 
         p = np.ones(v // b_min + 1)
 
         for d in range(1, v // b_min + 1):
-            p[d] = lamb / (mu / b_min * min(v, d * b_max)) * p[d - 1]
+            mu_d = mu / b_min * min(v, d * b_max)
+            p[d] = lamb / mu_d * sum(p[d - j] * sum(f[j - 1 :]) for j in range(1, d + 1))
 
         p = p / np.sum(p)
         self.p = p
@@ -111,19 +114,29 @@ class SolverOnlyElasticData:
         mu = self.params.data_mu
         b_min = self.params.data_resources_min
         b_max = self.params.data_resources_max
+        f = self.params.data_requests_batch_probs
 
         p = np.ones(v // b_min + 1)
 
         for d in range(1, v // b_min + 1):
-            p[d] = lamb / (mu / b_min * min(v, d * b_max)) * p[d - 1]
+            mu_d = mu / b_min * min(v, d * b_max)
+            p[d] = lamb / mu_d * sum(p[d - j] * sum(f[j - 1 :]) for j in range(1, d + 1))
 
         p = p / np.sum(p)
 
-        data_request_rej_prob = p[-1]
-        mean_data_requests_in_service = sum(p[d] * d for d in range(1, v // b_min + 1))
+        mean_data_requests_per_batch = sum(s * f[s - 1] for s in range(1, len(f) + 1))
+
+        rej_numer = sum(
+            p[d] * sum(f[s - 1] * max(s + d - (v // b_min), 0) for s in range(1, len(f) + 1))
+            for d in range(0, v // b_min + 1)
+        )
+
+        data_request_rej_prob = 1 / mean_data_requests_per_batch * rej_numer
+
+        mean_data_requests_in_service = sum(p[d] * d for d in range(0, v // b_min + 1))
 
         mean_data_request_service_time = mean_data_requests_in_service / (
-            lamb * (1 - data_request_rej_prob)
+            lamb * (1 - data_request_rej_prob) * mean_data_requests_per_batch
         )
 
         return mean_data_requests_in_service, mean_data_request_service_time
@@ -136,6 +149,7 @@ class SolverOnlyElasticData:
         mu = self.params.data_mu
         b_min = self.params.data_resources_min
         b_max = self.params.data_resources_max
+        f = self.params.data_requests_batch_probs
 
         metrics = Metrics(
             rt_request_rej_prob=[],
@@ -143,16 +157,24 @@ class SolverOnlyElasticData:
             mean_resources_per_rt_flow=[],
         )
 
-        metrics.data_request_rej_prob = p[-1]
-        metrics.mean_resources_per_data_flow = sum(
-            p[d] * min(v, d * b_max) for d in range(1, v // b_min + 1)
+        metrics.mean_data_requests_per_batch = sum(s * f[s - 1] for s in range(1, len(f) + 1))
+
+        rej_numer = sum(
+            p[d] * sum(f[s - 1] * max(s + d - (v // b_min), 0) for s in range(1, len(f) + 1))
+            for d in range(0, v // b_min + 1)
         )
-        metrics.mean_data_requests_in_service = sum(p[d] * d for d in range(1, v // b_min + 1))
+
+        metrics.data_request_rej_prob = 1 / metrics.mean_data_requests_per_batch * rej_numer
+
+        metrics.mean_resources_per_data_flow = sum(
+            p[d] * min(v, d * b_max) for d in range(0, v // b_min + 1)
+        )
+        metrics.mean_data_requests_in_service = sum(p[d] * d for d in range(0, v // b_min + 1))
         metrics.mean_resources_per_data_request = (
             metrics.mean_resources_per_data_flow / metrics.mean_data_requests_in_service
         )
         metrics.mean_data_request_service_time = metrics.mean_data_requests_in_service / (
-            lamb * (1 - metrics.data_request_rej_prob)
+            lamb * (1 - metrics.data_request_rej_prob) * metrics.mean_data_requests_per_batch
         )
 
         metrics.beam_utilization = metrics.mean_resources_per_data_flow
@@ -162,6 +184,7 @@ class SolverOnlyElasticData:
 
 class SolveApprox:
     """Approximate solver for multiservice model"""
+
     def __init__(self, params: ParametersSet):
         self.params = params
 
@@ -260,7 +283,13 @@ def get_argparser():
         default=1.0,
         help="Service rate (mu) for elastic data flow",
     )
-
+    parser.add_argument(
+        "--data_requests_batch_probs",
+        type=float,
+        nargs="+",
+        default=[1 / 3, 1 / 3, 1 / 3],
+        help="Batch probs f_s, s = 1, ..., B",
+    )
     # Beam capacity parameter
     parser.add_argument(
         "--beam_capacity",
@@ -286,6 +315,7 @@ if __name__ == "__main__":
         data_lambda=args.data_lambda,
         data_mu=args.data_mu,
         beam_capacity=args.beam_capacity,
+        data_requests_batch_probs=args.data_requests_batch_probs,
     )
 
     solver_rt = SolverOnlyRealTime(params)
@@ -294,10 +324,10 @@ if __name__ == "__main__":
     solver_data = SolverOnlyElasticData(params)
     metrics_data = solver_data.solve()
 
-    approx = SolveApprox(params)
+    # approx = SolveApprox(params)
 
-    pi_e_1, y_2, W_2, b_e_2 = approx.solve()
+    # pi_e_1, y_2, W_2, b_e_2 = approx.solve()
 
     logger.info("%s", str(metrics_rt))
     logger.info("%s", str(metrics_data))
-    logger.info("%s", f"{pi_e_1=}, {y_2=}, {W_2=}, {b_e_2=}")
+    # logger.info("%s", f"{pi_e_1=}, {y_2=}, {W_2=}, {b_e_2=}")
