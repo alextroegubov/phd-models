@@ -25,11 +25,13 @@ class Solver:
         d: int
 
         def ik_(self, k: int, delta=1):
+            """Get state (i_1, ..., i_k + delta, ..., i_n, d)"""
             i_vec = list(self.i_vec)
             i_vec[k] += delta
             return Solver.State(tuple(i_vec), self.d)
 
         def d_(self, delta=1):
+            """Get state (i_1, ..., i_n, d + delta)"""
             return Solver.State(self.i_vec, self.d + delta)
 
         def __hash__(self):
@@ -128,7 +130,7 @@ class Solver:
                     for k in range(n)
                 )
                 data_arr_n = sum(
-                    [self.states.get(st.d_(-s), 0.0) * lambda_e * (f[s-1] * (d - s >= 0) + (v - b_min + 1 <= l_tot <= v) * sum(f[s:]))
+                    [self.states.get(st.d_(-s), 0) * lambda_e * (f[s-1] + (v - l_tot < b_min) * sum(f[s:]))
                     for s in range(1, min(d, len(f)) + 1)]
                 )
                 data_serv_n = (
