@@ -191,16 +191,16 @@ class Solver:
 
         for state in self.states.keys():
             i_vec, d = state.i_vec, state.d
-            l = np.dot(i_vec, self.params.real_time_resources) + b_min * d
+            l_hat = np.dot(i_vec, self.params.real_time_resources) + b_min * d
 
             for k in range(rt_flows):
                 b_k = self.params.real_time_resources[k]
                 metrics.mean_rt_requests_in_service[k] += i_vec[k] * self.states[state]
 
-                metrics.rt_request_rej_prob[k] += self.states[state] * (l + b_k > v)
+                metrics.rt_request_rej_prob[k] += self.states[state] * (l_hat + b_k > v)
 
             pi_e_num += self.states[state] * sum(
-                f[s-1] * max(s - (v - l) // b_min, 0) for s in range(1, len(f) + 1)
+                f[s-1] * max(s - (v - l_hat) // b_min, 0) for s in range(1, len(f) + 1)
             )
 
             b_max = self.params.data_resources_max
