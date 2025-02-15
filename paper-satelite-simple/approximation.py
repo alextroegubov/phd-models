@@ -139,7 +139,7 @@ class SolverOnlyElasticData:
             lamb * (1 - data_request_rej_prob) * mean_data_requests_per_batch
         )
 
-        return mean_data_requests_in_service, mean_data_request_service_time
+        return mean_data_requests_in_service, mean_data_request_service_time, data_request_rej_prob
 
     def calculate_metrics(self, p: np.ndarray) -> Metrics:
         """Calculate metrics from the probabilities p"""
@@ -195,20 +195,10 @@ class SolveApprox:
         lamb = self.params.real_time_lambdas
         mu = self.params.real_time_mus
 
-        lamb_e = self.params.data_lambda
         mu_e = self.params.data_mu
         b_min = self.params.data_resources_min
 
         a = [lamb[k] / mu[k] for k in range(n)]
-
-        # pi_e^(1)
-        a_new = a.copy()
-        a_new.append(lamb_e / mu_e)
-        b_new = list(b)
-        b_new.append(b_min)
-        p = SolverOnlyRealTime.solve_approx(a_new, b_new, v)
-        pi_e_1 = sum(p[l] for l in range(v - b_min + 1, v + 1))
-
         # W_2, y_2, b_e_2
         p = SolverOnlyRealTime.solve_approx(a, b, v)
         ed_solver = SolverOnlyElasticData(self.params)
@@ -216,9 +206,14 @@ class SolveApprox:
         y_2 = 0
         W_2 = 0
         for l in range(0, v - b_min + 1):
-            y_e, w = ed_solver.solve_approx(v - l)
+            y_e, w, pi_e = ed_solver.solve_approx(v - l)
             y_2 += p[l] * y_e
             W_2 += p[l] * w
+
+        pi_e_1 = 0
+        for l in range(0, v + 1):
+            y_e, w, pi_e = ed_solver.solve_approx(v - l)
+            pi_e_1 += p[l] * pi_e
 
         b_e_2 = b_min / (mu_e * W_2)
         return pi_e_1, y_2, W_2, b_e_2
@@ -301,7 +296,7 @@ def get_argparser():
     return parser
 
 
-if __name__ == "__main__":
+def main():
     parser = get_argparser()
     args = parser.parse_args()
 
@@ -324,10 +319,14 @@ if __name__ == "__main__":
     solver_data = SolverOnlyElasticData(params)
     metrics_data = solver_data.solve()
 
-    # approx = SolveApprox(params)
+    approx = SolveApprox(params)
 
-    # pi_e_1, y_2, W_2, b_e_2 = approx.solve()
+    pi_e_1, y_2, W_2, b_e_2 = approx.solve()
 
     logger.info("%s", str(metrics_rt))
     logger.info("%s", str(metrics_data))
-    # logger.info("%s", f"{pi_e_1=}, {y_2=}, {W_2=}, {b_e_2=}")
+    logger.info("%s", f"{pi_e_1=}, {y_2=}, {W_2=}, {b_e_2=}")
+
+
+if __name__ == "__main__":
+    main()
