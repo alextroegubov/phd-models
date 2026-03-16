@@ -15,6 +15,7 @@ class ParametersSet:
     data_requests_batch_probs: list[float]
 
     beam_capacity: int
+    random_seed: int = 0
 
     def __str__(self) -> str:
 
