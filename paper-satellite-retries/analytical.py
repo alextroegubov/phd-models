@@ -81,7 +81,6 @@ class Solver:
 
     def preprocess(self):
 
-        rt_lambdas = np.array(self.params.real_time_lambdas)
         rt_resources = np.array(self.params.real_time_resources)
         v = self.params.beam_capacity
         b_min = self.params.data_resources_min
@@ -99,7 +98,6 @@ class Solver:
         self.idx_d_minus_1 = np.array(
             [self.state_to_idx.get(state.d_(-1), -1) for state in self.state_list], dtype=np.int32
         )
-
 
         self.idx_r_plus_1 = np.array(
             [self.state_to_idx.get(state.r_(1), -1) for state in self.state_list], dtype=np.int32
@@ -134,7 +132,7 @@ class Solver:
         nu = self.params.retry_intensity
         H = self.params.leave_probability
 
-        self.denominator = np.full(len(self.state_list), 0, dtype=np.float32)
+        self.denominator = [0] * len(self.state_list)
 
         for idx, st in enumerate(self.state_list):
             i_vec, d, r = np.array(st.i_vec), st.d, st.r
@@ -228,7 +226,6 @@ class Solver:
             for idx, st in enumerate(self.state_list):
                 i_vec, d, r = np.array(st.i_vec), st.d, st.r
                 l = self.l_arr[idx]
-                q = self.q_arr[idx]
                 q_prime = self.q_prime_arr[idx]
 
                 # denominator
