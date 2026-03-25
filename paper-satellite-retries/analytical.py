@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 import numpy as np
 from utils import ParametersSet, Metrics
-
+from numba import njit
 from typing import ClassVar
 
 logger = logging.getLogger(__name__)
@@ -28,7 +28,7 @@ class State:
 
     # v: ClassVar[int] = 0
 
-    r_max: ClassVar[int] = 40
+    r_max: ClassVar[int] = 50
 
     def ik_(self, k: int, delta=1):
         """Get state (i_1, ..., i_k + delta, ..., i_n, d, r)"""
@@ -140,7 +140,7 @@ class Solver:
         nu = self.params.retry_intensity
         H = self.params.leave_probability
 
-        self.denominator = [0] * len(self.state_list)
+        self.denominator = np.zeros(len(self.state_list), dtype=np.float64)
 
         for idx, st in enumerate(self.state_list):
             i_vec, d, r = np.array(st.i_vec), st.d, st.r
@@ -254,12 +254,6 @@ class Solver:
 
     def solve(self):
         """Solve the model."""
-        n = self.params.real_time_flows
-        flows_idx = list(range(n))
-
-        error = 1000
-        iteration = 0
-
         logger.info("Start solving the model")
         start_time = time.time()
 
@@ -267,77 +261,54 @@ class Solver:
         self.precompute_denominator()
         self.precompute_numerator_coefs()
 
-        while error > self.max_eps and iteration < self.max_iter:
-            iteration += 1
-            error = 0
+        # make sure everything is NumPy arrays with stable dtypes
+        self.denominator = np.asarray(self.denominator, dtype=np.float64)
 
-            for idx, st in enumerate(self.state_list):
-                # denominator
-                denr = self.denominator[idx]
+        self.idx_rt_minus = np.asarray(self.idx_rt_minus, dtype=np.int32)
+        self.idx_rt_plus = np.asarray(self.idx_rt_plus, dtype=np.int32)
 
-                # accept new RT request
-                num = 0
-                for k in flows_idx:
-                    idx_ = self.idx_rt_minus[idx][k]
-                    if idx_ >= 0:
-                        num += self.p[idx_] * self.real_time_arr_n_coefs[idx][k]
-                    idx_ = self.idx_rt_plus[idx][k]
-                    if idx_ >= 0:
-                        num += self.p[idx_] * self.real_time_serv_n_coefs[idx][k]
+        self.idx_d_minus_1 = np.asarray(self.idx_d_minus_1, dtype=np.int32)
+        self.idx_d_plus_1 = np.asarray(self.idx_d_plus_1, dtype=np.int32)
+        self.idx_r_minus_1 = np.asarray(self.idx_r_minus_1, dtype=np.int32)
+        self.idx_r_plus_1 = np.asarray(self.idx_r_plus_1, dtype=np.int32)
+        self.idx_d_plus_1_r_minus_1 = np.asarray(self.idx_d_plus_1_r_minus_1, dtype=np.int32)
+        self.idx_d_minus_1_r_plus_1 = np.asarray(self.idx_d_minus_1_r_plus_1, dtype=np.int32)
 
-                # accept ET request
-                idx_ = self.idx_d_minus_1[idx]
-                if idx_ >= 0:
-                    # data_arr_accept_n
-                    num += self.p[idx_] * self.data_arr_accept_n_coef[idx]
+        self.real_time_arr_n_coefs = np.asarray(self.real_time_arr_n_coefs, dtype=np.float64)
+        self.real_time_serv_n_coefs = np.asarray(self.real_time_serv_n_coefs, dtype=np.float64)
 
-                # reject ET request and it is retried
-                idx_ = self.idx_r_minus_1[idx]
-                if idx_ >= 0:
-                    # data_arr_reject_n
-                    num += self.p[idx_] * self.data_arr_reject_n_coef[idx]
+        self.data_arr_accept_n_coef = np.asarray(self.data_arr_accept_n_coef, dtype=np.float64)
+        self.data_arr_reject_n_coef = np.asarray(self.data_arr_reject_n_coef, dtype=np.float64)
+        self.data_serv_n_coef = np.asarray(self.data_serv_n_coef, dtype=np.float64)
+        self.freeze_n_coef = np.asarray(self.freeze_n_coef, dtype=np.float64)
+        self.freeze_out_n_coef = np.asarray(self.freeze_out_n_coef, dtype=np.float64)
+        self.retry_accept_n_coef = np.asarray(self.retry_accept_n_coef, dtype=np.float64)
+        self.retry_reject_n_coef = np.asarray(self.retry_reject_n_coef, dtype=np.float64)
 
-                # serve ET request
-                idx_ = self.idx_d_plus_1[idx]
-                if idx_ >= 0:
-                    # data_serv_n
-                    num += self.p[idx_] * self.data_serv_n_coef[idx]
-
-                # go to retries from freeze queue
-                idx_ = self.idx_d_plus_1_r_minus_1[idx]
-                if idx_ >= 0:
-                    # freeze_n
-                    num += self.p[idx_] * self.freeze_n_coef[idx]
-
-                # go out of the system from freeze queue
-                idx_ = self.idx_d_plus_1[idx]
-                if idx_ >= 0:
-                    # freeze_out_n
-                    num += self.p[idx_] * self.freeze_out_n_coef[idx]
-
-                # accept retry request
-                idx_ = self.idx_d_minus_1_r_plus_1[idx]
-                if idx_ >= 0:
-                    # retry_accept_n
-                    num += self.p[idx_] * self.retry_accept_n_coef[idx]
-
-                # reject retry request and it leaves the system
-                idx_ = self.idx_r_plus_1[idx]
-                if idx_ >= 0:
-                    # retry_reject_n
-                    num += self.p[idx_] * self.retry_reject_n_coef[idx]
-
-                prev_prob = self.p[idx]
-                error += abs(prev_prob - num / denr) / prev_prob
-                self.p[idx] = num / denr
-
-            if iteration % 50 == 0:
-                logger.info(
-                    "Iteration %d: error = %2.8f, time = %4.2f",
-                    iteration,
-                    error,
-                    time.time() - start_time,
-                )
+        # warm-up compile happens on first call
+        iteration, error = solve_numba(
+            self.p,
+            self.max_eps,
+            self.max_iter,
+            self.denominator,
+            self.idx_rt_minus,
+            self.idx_rt_plus,
+            self.idx_d_minus_1,
+            self.idx_d_plus_1,
+            self.idx_r_minus_1,
+            self.idx_r_plus_1,
+            self.idx_d_plus_1_r_minus_1,
+            self.idx_d_minus_1_r_plus_1,
+            self.real_time_arr_n_coefs,
+            self.real_time_serv_n_coefs,
+            self.data_arr_accept_n_coef,
+            self.data_arr_reject_n_coef,
+            self.data_serv_n_coef,
+            self.freeze_n_coef,
+            self.freeze_out_n_coef,
+            self.retry_accept_n_coef,
+            self.retry_reject_n_coef,
+        )
 
         logger.info(
             "Model solved in %d iterations for %4.2f sec",
@@ -460,6 +431,140 @@ class Solver:
         )
 
 
+@njit(cache=True)
+def gs_sweep_numba(
+    p,
+    denominator,
+    idx_rt_minus,
+    idx_rt_plus,
+    idx_d_minus_1,
+    idx_d_plus_1,
+    idx_r_minus_1,
+    idx_r_plus_1,
+    idx_d_plus_1_r_minus_1,
+    idx_d_minus_1_r_plus_1,
+    real_time_arr_n_coefs,
+    real_time_serv_n_coefs,
+    data_arr_accept_n_coef,
+    data_arr_reject_n_coef,
+    data_serv_n_coef,
+    freeze_n_coef,
+    freeze_out_n_coef,
+    retry_accept_n_coef,
+    retry_reject_n_coef,
+):
+    n_states = p.shape[0]
+    n_flows = idx_rt_minus.shape[1]
+
+    max_diff = 0.0
+
+    for idx in range(n_states):
+        denr = denominator[idx]
+        num = 0.0
+
+        # RT terms
+        for k in range(n_flows):
+            j = idx_rt_minus[idx, k]
+            if j >= 0:
+                num += p[j] * real_time_arr_n_coefs[idx, k]
+
+            j = idx_rt_plus[idx, k]
+            if j >= 0:
+                num += p[j] * real_time_serv_n_coefs[idx, k]
+
+        # ET accept
+        j = idx_d_minus_1[idx]
+        if j >= 0:
+            num += p[j] * data_arr_accept_n_coef[idx]
+
+        # ET reject -> retry
+        j = idx_r_minus_1[idx]
+        if j >= 0:
+            num += p[j] * data_arr_reject_n_coef[idx]
+
+        # ET service
+        j = idx_d_plus_1[idx]
+        if j >= 0:
+            num += p[j] * data_serv_n_coef[idx]
+            num += p[j] * freeze_out_n_coef[idx]   # same neighbor, so combine here
+
+        # frozen -> retry
+        j = idx_d_plus_1_r_minus_1[idx]
+        if j >= 0:
+            num += p[j] * freeze_n_coef[idx]
+
+        # retry accepted
+        j = idx_d_minus_1_r_plus_1[idx]
+        if j >= 0:
+            num += p[j] * retry_accept_n_coef[idx]
+
+        # retry rejected and leaves
+        j = idx_r_plus_1[idx]
+        if j >= 0:
+            num += p[j] * retry_reject_n_coef[idx]
+
+        new_prob = num / denr
+        diff = abs(new_prob - p[idx])
+        if diff > max_diff:
+            max_diff = diff
+
+        p[idx] = new_prob
+
+    return max_diff
+
+@njit(cache=True)
+def solve_numba(
+    p,
+    max_eps,
+    max_iter,
+    denominator,
+    idx_rt_minus,
+    idx_rt_plus,
+    idx_d_minus_1,
+    idx_d_plus_1,
+    idx_r_minus_1,
+    idx_r_plus_1,
+    idx_d_plus_1_r_minus_1,
+    idx_d_minus_1_r_plus_1,
+    real_time_arr_n_coefs,
+    real_time_serv_n_coefs,
+    data_arr_accept_n_coef,
+    data_arr_reject_n_coef,
+    data_serv_n_coef,
+    freeze_n_coef,
+    freeze_out_n_coef,
+    retry_accept_n_coef,
+    retry_reject_n_coef,
+):
+    iteration = 0
+    error = 1e100
+
+    while error > max_eps and iteration < max_iter:
+        iteration += 1
+        error = gs_sweep_numba(
+            p,
+            denominator,
+            idx_rt_minus,
+            idx_rt_plus,
+            idx_d_minus_1,
+            idx_d_plus_1,
+            idx_r_minus_1,
+            idx_r_plus_1,
+            idx_d_plus_1_r_minus_1,
+            idx_d_minus_1_r_plus_1,
+            real_time_arr_n_coefs,
+            real_time_serv_n_coefs,
+            data_arr_accept_n_coef,
+            data_arr_reject_n_coef,
+            data_serv_n_coef,
+            freeze_n_coef,
+            freeze_out_n_coef,
+            retry_accept_n_coef,
+            retry_reject_n_coef,
+        )
+
+    return iteration, error
+
 def main():
     """Main function. Parses args from command line and runs simulation"""
     # parser = get_argparser()
@@ -474,13 +579,13 @@ def main():
         data_resources_max=100,
         data_lambda=10,
         data_mu=1,
-        beam_capacity=30,
+        beam_capacity=20,
         queue_intensity=1,
         retry_intensity=1,
         leave_probability=0.8,
     )
 
-    solver = Solver(params, 1e-7, 800)
+    solver = Solver(params, 1e-7, 2000)
     print(len(solver.state_list))
     it, error = solver.solve()
     logger.info("Final: it=%d, error=%2.10f", it, error)
