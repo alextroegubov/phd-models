@@ -29,7 +29,7 @@ class State:
 
     # v: ClassVar[int] = 0
 
-    r_max: ClassVar[int] = 20
+    r_max: ClassVar[int] = 40
 
     def ik_(self, k: int, delta=1):
         """Get state (i_1, ..., i_k + delta, ..., i_n, d, r)"""
@@ -79,15 +79,16 @@ class Solver:
     def get_possible_states(self) -> list[State]:
         """Get possible states for markov process."""
         beam_capacity = self.params.beam_capacity
+        b_min = self.params.data_resources_min    
 
         max_data_flows = beam_capacity
-        data_flow_states = np.arange(max_data_flows + 1, dtype=int)
+        data_flow_states = np.arange(max_data_flows // b_min + 1, dtype=int)
 
         real_time_flows_states = [
             np.arange(beam_capacity // b + 1, dtype=int) for b in self.params.real_time_resources
         ]
 
-        retries_states = np.arange(State.r_max + 1, dtype=int)
+        retries_states = np.arange(State.r_max, dtype=int)
 
         # product of possible values
         states = itertools.product(*real_time_flows_states, data_flow_states, retries_states)
@@ -109,6 +110,7 @@ class Solver:
 
         lambda_e = self.params.data_lambda
         mu_e = self.params.data_mu
+        b_min = self.params.data_resources_min
 
         v = self.params.beam_capacity
         sigma = self.params.queue_intensity
@@ -130,16 +132,17 @@ class Solver:
             for st, prev_prob in self.states.items():
                 i_vec, d, r = np.array(st.i_vec), st.d, st.r
                 l = np.dot(i_vec, b)
-                q = max(0, l + d - v)
+                q = max(0, d - (v - l) // b_min)
+                q_prime = max(0, d + 1 - (v - l) // b_min)
                 # accept new RT request
                 real_time_arrival_d = sum(lamb[k] * (l + b[k] <= v) for k in range(n))
                 # serve RT request
                 real_time_serv_d = sum(i_vec[k] * mu[k] * (i_vec[k] > 0) for k in range(n))
 
                 # accept ET request
-                data_arr_accept_d = lambda_e * (l + d + 1 <= v)
+                data_arr_accept_d = lambda_e * (l + d * b_min + b_min <= v)
                 # reject ET request and it is retried
-                data_arr_reject_d = lambda_e * H * (l + d + 1 > v)
+                data_arr_reject_d = lambda_e * H * (l + d * b_min + b_min > v)
 
                 # serve ET request
                 data_serv_d = mu_e * (v - l) * (d - q > 0)
@@ -147,9 +150,9 @@ class Solver:
                 freeze_d = q * sigma * (q > 0)
 
                 # accept retry request
-                retry_accept_d = r * nu * (l + d + 1 <= v)
+                retry_accept_d = r * nu * (l + d * b_min + b_min <= v)
                 # reject retry request and it leaves the system
-                retry_reject_d = r * nu * (1 - H) * (l + d + 1 > v)
+                retry_reject_d = r * nu * (1 - H) * (l + d * b_min + b_min > v)
 
                 # denominator
                 denr = (
@@ -175,32 +178,41 @@ class Solver:
 
                 # accept ET request
                 data_arr_accept_n = (
-                    self.states.get(st.d_(-1), 0) * lambda_e * (l + (d - 1) + 1 <= v and d > 0)
+                    self.states.get(st.d_(-1), 0) * lambda_e * (l + (d - 1) * b_min + b_min <= v and d > 0)
                 )
                 # reject ET request and it is retried
                 data_arr_reject_n = (
-                    self.states.get(st.r_(-1), 0) * lambda_e * H * (r > 0 and l + d + 1 > v)
+                    self.states.get(st.r_(-1), 0) * lambda_e * H * (r > 0 and l + d * b_min + b_min > v)
                 )
 
                 # serve ET request
-                data_serv_n = self.states.get(st.d_(1), 0) * mu_e * (v - l) * (d + 1 - max(0, l + d + 1 - v) > 0)
+                data_serv_n = self.states.get(st.d_(1), 0) * mu_e * (v - l) * (d + 1 - q_prime > 0)
                 # go to retries from freeze queue
                 freeze_n = (
-                    max(0, l + d + 1 - v)
+                    q_prime
                     * sigma
+                    * H
                     * self.states.get(st.dr_(d_d=1, d_r=-1), 0)
-                    * (max(0, l + d + 1 - v) > 0 and r > 0)
+                    * (q_prime > 0 and r > 0)
                 )
+                # go out of the system from freeze queue
+                freeze_out_n = (
+                    q_prime
+                    * sigma
+                    * (1 - H)
+                    * self.states.get(st.d_(1), 0)
+                    * (q_prime > 0)
+                )                
 
                 # accept retry request
                 retry_accept_n = (
                     (r + 1)
                     * nu
                     * self.states.get(st.dr_(d_d=-1, d_r=1), 0)
-                    * (d > 0 and l + (d - 1) + 1 <= v)
+                    * (d > 0 and l + (d - 1) * b_min + b_min <= v)
                 )
                 # reject retry request and it leaves the system
-                retry_reject_n = (r + 1) * nu * (1 - H) * self.states.get(st.r_(1), 0) * (l + d + 1 > v)
+                retry_reject_n = (r + 1) * nu * (1 - H) * self.states.get(st.r_(1), 0) * (l + d * b_min + b_min > v)
 
                 numr = (
                     real_time_arr_n
@@ -209,6 +221,7 @@ class Solver:
                     + data_arr_reject_n
                     + data_serv_n
                     + freeze_n
+                    + freeze_out_n
                     + retry_accept_n
                     + retry_reject_n
                 )
@@ -254,11 +267,12 @@ class Solver:
         v = self.params.beam_capacity
         lambda_e = self.params.data_lambda
         nu = self.params.retry_intensity
+        b_min = self.params.data_resources_min
 
         for state in self.states.keys():
             i_vec, d, r = state.i_vec, state.d, state.r
             l = np.dot(i_vec, self.params.real_time_resources)
-            q = max(0, l + d - v)
+            q = max(0, d - (v - l) // b_min)
 
             for k in range(rt_flows):
                 b_k = self.params.real_time_resources[k]
@@ -269,7 +283,7 @@ class Solver:
             metrics.mean_freeze_requests += self.states[state] * q
             metrics.mean_retry_requests += self.states[state] * r
             metrics.intensity_blocked_requests += (
-                self.states[state] * (l + d + 1 > v) * (lambda_e + r * nu)
+                self.states[state] * (l + d * b_min + b_min > v) * (lambda_e + r * nu)
             )
             metrics.mean_data_requests_in_service += self.states[state] * (d - q) * (d - q > 0)
             metrics.mean_resources_per_data_flow += self.states[state] * (v - l) * (d - q > 0)
@@ -320,8 +334,8 @@ class Solver:
         logger.info(
             "Retry flow balance (%2.5f, %2.5f): %s",
             y_r * nu,
-            Lambda_b * H + y_q * sigma,
-            np.isclose(y_r * nu, Lambda_b * H + y_q * sigma),
+            Lambda_b * H + y_q * sigma * H,
+            np.isclose(y_r * nu, Lambda_b * H + y_q * sigma * H),
         )
 
         # elastic data flow
@@ -335,6 +349,18 @@ class Solver:
             np.isclose(Lambda, Lambda_b + y_q * sigma + m_e * mu_e),
         )
 
+        # elastic data flow
+        L_e = (1 - H) * (metrics.intensity_blocked_requests + y_q * sigma)
+        mu_e = self.params.data_mu
+        m_e = metrics.mean_resources_per_data_flow
+        lambda_e = self.params.data_lambda
+        logger.info(
+            "Primary elastic flow balance (%2.5f, %2.5f): %s",
+            lambda_e,
+            L_e + m_e * mu_e,
+            np.isclose(lambda_e, L_e + m_e * mu_e),
+        )
+
 
 def main():
     """Main function. Parses args from command line and runs simulation"""
@@ -343,20 +369,20 @@ def main():
 
     params = ParametersSet(
         real_time_flows=1,
-        real_time_lambdas=[3],
+        real_time_lambdas=[2],
         real_time_mus=[1],
-        real_time_resources=[2],
-        data_resources_min=1,
+        real_time_resources=[4],
+        data_resources_min=2,
         data_resources_max=100,
-        data_lambda=4,
-        data_mu=2,
-        beam_capacity=15,
+        data_lambda=10,
+        data_mu=1,
+        beam_capacity=30,
         queue_intensity=1,
         retry_intensity=1,
         leave_probability=0.8,
     )
 
-    solver = Solver(params, 1e-7, 400)
+    solver = Solver(params, 1e-7, 800)
     print(len(solver.states))
     it, error = solver.solve()
     logger.info("Final: it=%d, error=%2.10f", it, error)
