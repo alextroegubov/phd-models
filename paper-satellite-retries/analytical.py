@@ -115,7 +115,6 @@ class Solver:
             [self.state_to_idx.get(state.dr_(d_d=-1, d_r=1), -1) for state in self.state_list], dtype=np.int32
         )
 
-
     def precompute_denominator(self):
 
         n = self.params.real_time_flows
@@ -169,6 +168,48 @@ class Solver:
                 + retry_reject_d
             )
 
+    def precompute_numerator_coefs(self):
+        n = self.params.real_time_flows
+        lamb = np.array(self.params.real_time_lambdas)
+        mu = np.array(self.params.real_time_mus)
+        b = np.array(self.params.real_time_resources)
+
+        lambda_e = self.params.data_lambda
+        mu_e = self.params.data_mu
+        b_min = self.params.data_resources_min
+
+        v = self.params.beam_capacity
+        sigma = self.params.queue_intensity
+        nu = self.params.retry_intensity
+        H = self.params.leave_probability
+
+        self.data_arr_accept_n_coef = [0] * len(self.state_list)
+        self.data_arr_reject_n_coef = [0] * len(self.state_list)
+        self.data_serv_n_coef = [0] * len(self.state_list)
+        self.freeze_n_coef = [0] * len(self.state_list)
+        self.freeze_out_n_coef = [0] * len(self.state_list)
+        self.retry_accept_n_coef = [0] * len(self.state_list)
+        self.retry_reject_n_coef = [0] * len(self.state_list)
+
+        for idx, st in enumerate(self.state_list):
+            i_vec, d, r = np.array(st.i_vec), st.d, st.r
+            l = self.l_arr[idx]
+            q_prime = self.q_prime_arr[idx]
+
+            self.data_arr_accept_n_coef[idx] = lambda_e * (l + (d - 1) * b_min + b_min <= v and d > 0)
+
+            self.data_arr_reject_n_coef[idx] = lambda_e * H * (r > 0 and l + d * b_min + b_min > v)
+
+            self.data_serv_n_coef[idx] = mu_e * (v - l) * (d + 1 - q_prime > 0)
+
+            self.freeze_n_coef[idx] = q_prime * sigma * H * (q_prime > 0 and r > 0)
+
+            self.freeze_out_n_coef[idx] = q_prime * sigma * (1 - H) * (q_prime > 0)
+
+            self.retry_accept_n_coef[idx] = (r + 1) * nu * (d > 0 and l + (d - 1) * b_min + b_min <= v)
+
+            self.retry_reject_n_coef[idx] = (r + 1) * nu * (1 - H) * (l + d * b_min + b_min > v)
+
     def get_possible_states(self) -> list[State]:
         """Get possible states for markov process."""
         beam_capacity = self.params.beam_capacity
@@ -218,6 +259,7 @@ class Solver:
 
         self.preprocess()
         self.precompute_denominator()
+        self.precompute_numerator_coefs()
 
         while error > self.max_eps and iteration < self.max_iter:
             iteration += 1
@@ -244,47 +286,43 @@ class Solver:
                 idx_ = self.idx_d_minus_1[idx]
                 if idx_ >= 0:
                     # data_arr_accept_n
-                    num += self.prob_of(self.state_list[idx_]) * lambda_e * (l + (d - 1) * b_min + b_min <= v and d > 0)
+                    num += self.prob_of(self.state_list[idx_]) * self.data_arr_accept_n_coef[idx]
 
                 # reject ET request and it is retried
                 idx_ = self.idx_r_minus_1[idx]
                 if idx_ >= 0:
                     # data_arr_reject_n
-                    num += self.prob_of(self.state_list[idx_]) * lambda_e * H * (r > 0 and l + d * b_min + b_min > v)
+                    num += self.prob_of(self.state_list[idx_]) * self.data_arr_reject_n_coef[idx]
 
                 # serve ET request
                 idx_ = self.idx_d_plus_1[idx]
                 if idx_ >= 0:
                     # data_serv_n
-                    num += self.prob_of(st.d_(1)) * mu_e * (v - l) * (d + 1 - q_prime > 0)
+                    num += self.prob_of(self.state_list[idx_]) * self.data_serv_n_coef[idx]
 
                 # go to retries from freeze queue
                 idx_ = self.idx_d_plus_1_r_minus_1[idx]
                 if idx_ >= 0:
                     # freeze_n
-                    num += q_prime * sigma * H * self.prob_of(st.dr_(d_d=1, d_r=-1)) * (q_prime > 0 and r > 0)
+                    num += self.prob_of(self.state_list[idx_]) * self.freeze_n_coef[idx]
 
                 # go out of the system from freeze queue
                 idx_ = self.idx_d_plus_1[idx]
                 if idx_ >= 0:
                     # freeze_out_n
-                    num += q_prime * sigma * (1 - H) * self.prob_of(st.d_(1)) * (q_prime > 0)
+                    num += self.prob_of(self.state_list[idx_]) * self.freeze_out_n_coef[idx]
 
                 # accept retry request
                 idx_ = self.idx_d_minus_1_r_plus_1[idx]
                 if idx_ >= 0:
                     # retry_accept_n
-                    num += (
-                        (r + 1)
-                        * nu
-                        * self.prob_of(st.dr_(d_d=-1, d_r=1))
-                        * (d > 0 and l + (d - 1) * b_min + b_min <= v)
-                    )
+                    num += self.prob_of(self.state_list[idx_]) * self.retry_accept_n_coef[idx]
+
                 # reject retry request and it leaves the system
                 idx_ = self.idx_r_plus_1[idx]
                 if idx_ >= 0:
                     # retry_reject_n
-                    num += (r + 1) * nu * (1 - H) * self.prob_of(st.r_(1)) * (l + d * b_min + b_min > v)
+                    num += self.prob_of(self.state_list[idx_]) * self.retry_reject_n_coef[idx]
 
                 prev_prob = self.p[idx]
                 error += abs(prev_prob - num / denr) / prev_prob
