@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import logging
 import itertools
 import time
@@ -70,23 +69,53 @@ class Solver:
 
         logger.info("%s", self.params)
 
-        self.states: dict[State, float] = {
-            state: 1e-2 for state in self.get_possible_states()
-        }
+        self.state_list = self.get_possible_states()
+        self.state_to_idx = {state: idx for idx, state in enumerate(self.state_list)}
+        self.p = np.full(len(self.state_list), 1e-2, dtype=np.float64)
 
-        logger.info("Number of states: %d", len(self.states))
+        logger.info("Number of states: %d", len(self.state_list))
+
+    def prob_of(self, state: State) -> float:
+        idx = self.state_to_idx.get(state, None)
+        return 0.0 if idx is None else self.p[idx]
+
+    def preprocess(self):
+
+        rt_lambdas = np.array(self.params.real_time_lambdas)
+        rt_resources = np.array(self.params.real_time_resources)
+        v = self.params.beam_capacity
+        b_min = self.params.data_resources_min
+
+        self.l_arr = np.array([np.dot(state.i_vec, rt_resources) for state in self.state_list])
+        self.q_arr = np.array([max(0, state.d - (v - l) // b_min) for (state, l) in zip(self.state_list, self.l_arr)])
+        self.q_prime_arr = np.array(
+            [max(0, state.d + 1 - (v - l) // b_min) for state, l in zip(self.state_list, self.l_arr)]
+        )
+
+        self.idx_d_plus_1 = np.full(len(self.state_list), -1, dtype=np.int32)
+        self.idx_d_minus_1 = np.full(len(self.state_list), -1, dtype=np.int32)
+        self.idx_r_plus_1 = np.full(len(self.state_list), -1, dtype=np.int32)
+        self.idx_r_minus_1 = np.full(len(self.state_list), -1, dtype=np.int32)
+        self.idx_d_plus_1_r_minus_1 = np.full(len(self.state_list), -1, dtype=np.int32)
+        self.idx_d_minus_1_r_plus_1 = np.full(len(self.state_list), -1, dtype=np.int32)
+
+        for idx, state in enumerate(self.state_list):
+            self.idx_d_plus_1[idx] = self.state_to_idx.get(state.d_(1), -1)
+            self.idx_d_minus_1[idx] = self.state_to_idx.get(state.d_(-1), -1)
+            self.idx_r_plus_1[idx] = self.state_to_idx.get(state.r_(1), -1)
+            self.idx_r_minus_1[idx] = self.state_to_idx.get(state.r_(-1), -1)
+            self.idx_d_plus_1_r_minus_1[idx] = self.state_to_idx.get(state.dr_(d_d=1, d_r=-1), -1)
+            self.idx_d_minus_1_r_plus_1[idx] = self.state_to_idx.get(state.dr_(d_d=-1, d_r=1), -1)
 
     def get_possible_states(self) -> list[State]:
         """Get possible states for markov process."""
         beam_capacity = self.params.beam_capacity
-        b_min = self.params.data_resources_min    
+        b_min = self.params.data_resources_min
 
         max_data_flows = beam_capacity
         data_flow_states = np.arange(max_data_flows // b_min + 1, dtype=int)
 
-        real_time_flows_states = [
-            np.arange(beam_capacity // b + 1, dtype=int) for b in self.params.real_time_resources
-        ]
+        real_time_flows_states = [np.arange(beam_capacity // b + 1, dtype=int) for b in self.params.real_time_resources]
 
         retries_states = np.arange(State.r_max, dtype=int)
 
@@ -125,15 +154,16 @@ class Solver:
         logger.info("Start solving the model")
         start_time = time.time()
 
+        self.preprocess()
         while error > self.max_eps and iteration < self.max_iter:
             iteration += 1
             error = 0
 
-            for st, prev_prob in self.states.items():
+            for idx, st in enumerate(self.state_list):
                 i_vec, d, r = np.array(st.i_vec), st.d, st.r
-                l = np.dot(i_vec, b)
-                q = max(0, d - (v - l) // b_min)
-                q_prime = max(0, d + 1 - (v - l) // b_min)
+                l = self.l_arr[idx]
+                q = self.q_arr[idx]
+                q_prime = self.q_prime_arr[idx]
                 # accept new RT request
                 real_time_arrival_d = sum(lamb[k] * (l + b[k] <= v) for k in range(n))
                 # serve RT request
@@ -167,66 +197,60 @@ class Solver:
                 )
 
                 # accept new RT request
-                real_time_arr_n = sum(
-                    self.states.get(st.ik_(k, -1), 0) * lamb[k] * (i_vec[k] > 0) for k in flows_idx
-                )
+                real_time_arr_n = sum(self.prob_of(st.ik_(k, -1)) * lamb[k] * (i_vec[k] > 0) for k in flows_idx)
                 # serve RT request
                 real_time_serv_n = sum(
-                    self.states.get(st.ik_(k, +1), 0) * (i_vec[k] + 1) * mu[k] * (l + b[k] <= v)
-                    for k in flows_idx
+                    self.prob_of(st.ik_(k, +1)) * (i_vec[k] + 1) * mu[k] * (l + b[k] <= v) for k in flows_idx
                 )
+
+                num = real_time_arr_n + real_time_serv_n
 
                 # accept ET request
-                data_arr_accept_n = (
-                    self.states.get(st.d_(-1), 0) * lambda_e * (l + (d - 1) * b_min + b_min <= v and d > 0)
-                )
+                idx_ = self.idx_d_minus_1[idx]
+                if idx_ >= 0:
+                    # data_arr_accept_n
+                    num += self.prob_of(self.state_list[idx_]) * lambda_e * (l + (d - 1) * b_min + b_min <= v and d > 0)
+
                 # reject ET request and it is retried
-                data_arr_reject_n = (
-                    self.states.get(st.r_(-1), 0) * lambda_e * H * (r > 0 and l + d * b_min + b_min > v)
-                )
+                idx_ = self.idx_r_minus_1[idx]
+                if idx_ >= 0:
+                    # data_arr_reject_n
+                    num += self.prob_of(self.state_list[idx_]) * lambda_e * H * (r > 0 and l + d * b_min + b_min > v)
 
                 # serve ET request
-                data_serv_n = self.states.get(st.d_(1), 0) * mu_e * (v - l) * (d + 1 - q_prime > 0)
+                idx_ = self.idx_d_plus_1[idx]
+                if idx_ >= 0:
+                    # data_serv_n
+                    num += self.prob_of(st.d_(1)) * mu_e * (v - l) * (d + 1 - q_prime > 0)
+
                 # go to retries from freeze queue
-                freeze_n = (
-                    q_prime
-                    * sigma
-                    * H
-                    * self.states.get(st.dr_(d_d=1, d_r=-1), 0)
-                    * (q_prime > 0 and r > 0)
-                )
+                idx_ = self.idx_d_plus_1_r_minus_1[idx]
+                if idx_ >= 0:
+                    # freeze_n
+                    num += q_prime * sigma * H * self.prob_of(st.dr_(d_d=1, d_r=-1)) * (q_prime > 0 and r > 0)
+
                 # go out of the system from freeze queue
-                freeze_out_n = (
-                    q_prime
-                    * sigma
-                    * (1 - H)
-                    * self.states.get(st.d_(1), 0)
-                    * (q_prime > 0)
-                )                
+                idx_ = self.idx_d_plus_1[idx]
+                if idx_ >= 0:
+                    # freeze_out_n
+                    num += q_prime * sigma * (1 - H) * self.prob_of(st.d_(1)) * (q_prime > 0)
 
                 # accept retry request
-                retry_accept_n = (
-                    (r + 1)
-                    * nu
-                    * self.states.get(st.dr_(d_d=-1, d_r=1), 0)
-                    * (d > 0 and l + (d - 1) * b_min + b_min <= v)
-                )
+                idx_ = self.idx_d_minus_1_r_plus_1[idx]
+                if idx_ >= 0:
+                    # retry_accept_n
+                    num += (
+                        (r + 1) * nu * self.prob_of(st.dr_(d_d=-1, d_r=1)) * (d > 0 and l + (d - 1) * b_min + b_min <= v)
+                    )
                 # reject retry request and it leaves the system
-                retry_reject_n = (r + 1) * nu * (1 - H) * self.states.get(st.r_(1), 0) * (l + d * b_min + b_min > v)
+                idx_ = self.idx_r_plus_1[idx]
+                if idx_ >= 0:
+                    # retry_reject_n
+                    num += (r + 1) * nu * (1 - H) * self.prob_of(st.r_(1)) * (l + d * b_min + b_min > v)
 
-                numr = (
-                    real_time_arr_n
-                    + real_time_serv_n
-                    + data_arr_accept_n
-                    + data_arr_reject_n
-                    + data_serv_n
-                    + freeze_n
-                    + freeze_out_n
-                    + retry_accept_n
-                    + retry_reject_n
-                )
-                error += abs(prev_prob - numr / denr) / prev_prob
-                self.states[st] = numr / denr
+                prev_prob = self.p[idx]
+                error += abs(prev_prob - num / denr) / prev_prob
+                self.p[idx] = num / denr
 
             if iteration % 50 == 0:
                 logger.info(
@@ -241,10 +265,8 @@ class Solver:
             iteration,
             time.time() - start_time,
         )
-        norm = sum(self.states.values())
 
-        for key, value in self.states.items():
-            self.states[key] = value / norm
+        self.p = self.p / self.p.sum()
 
         metrics = self.calculate_metrics()
         logger.info("%s", metrics)
@@ -269,24 +291,23 @@ class Solver:
         nu = self.params.retry_intensity
         b_min = self.params.data_resources_min
 
-        for state in self.states.keys():
+        for idx, state in enumerate(self.state_list):
+            prob = self.p[idx]
             i_vec, d, r = state.i_vec, state.d, state.r
             l = np.dot(i_vec, self.params.real_time_resources)
             q = max(0, d - (v - l) // b_min)
 
             for k in range(rt_flows):
                 b_k = self.params.real_time_resources[k]
-                metrics.mean_rt_requests_in_service[k] += i_vec[k] * self.states[state]
+                metrics.mean_rt_requests_in_service[k] += i_vec[k] * prob
 
-                metrics.rt_request_rej_prob[k] += self.states[state] * (l + b_k > v)
+                metrics.rt_request_rej_prob[k] += prob * (l + b_k > v)
 
-            metrics.mean_freeze_requests += self.states[state] * q
-            metrics.mean_retry_requests += self.states[state] * r
-            metrics.intensity_blocked_requests += (
-                self.states[state] * (l + d * b_min + b_min > v) * (lambda_e + r * nu)
-            )
-            metrics.mean_data_requests_in_service += self.states[state] * (d - q) * (d - q > 0)
-            metrics.mean_resources_per_data_flow += self.states[state] * (v - l) * (d - q > 0)
+            metrics.mean_freeze_requests += prob * q
+            metrics.mean_retry_requests += prob * r
+            metrics.intensity_blocked_requests += prob * (l + d * b_min + b_min > v) * (lambda_e + r * nu)
+            metrics.mean_data_requests_in_service += prob * (d - q) * (d - q > 0)
+            metrics.mean_resources_per_data_flow += prob * (v - l) * (d - q > 0)
 
         metrics.intensity_all_requests = lambda_e + metrics.mean_retry_requests * nu
 
@@ -299,9 +320,7 @@ class Solver:
             metrics.mean_resources_per_data_flow / metrics.mean_data_requests_in_service
         )
 
-        metrics.beam_utilization = (
-            sum(metrics.mean_resources_per_rt_flow) + metrics.mean_resources_per_data_flow
-        )
+        metrics.beam_utilization = sum(metrics.mean_resources_per_rt_flow) + metrics.mean_resources_per_data_flow
         return metrics
 
     def check_solution(self, metrics: Metrics):
@@ -383,7 +402,7 @@ def main():
     )
 
     solver = Solver(params, 1e-7, 800)
-    print(len(solver.states))
+    print(len(solver.state_list))
     it, error = solver.solve()
     logger.info("Final: it=%d, error=%2.10f", it, error)
 
