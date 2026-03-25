@@ -84,6 +84,7 @@ class Solver:
         rt_resources = np.array(self.params.real_time_resources)
         v = self.params.beam_capacity
         b_min = self.params.data_resources_min
+        n_flows = self.params.real_time_flows
 
         self.l_arr = np.array([np.dot(state.i_vec, rt_resources) for state in self.state_list])
         self.q_arr = np.array([max(0, state.d - (v - l) // b_min) for (state, l) in zip(self.state_list, self.l_arr)])
@@ -114,6 +115,14 @@ class Solver:
         self.idx_d_minus_1_r_plus_1 = np.array(
             [self.state_to_idx.get(state.dr_(d_d=-1, d_r=1), -1) for state in self.state_list], dtype=np.int32
         )
+
+        self.idx_rt_minus = np.full((len(self.state_list), n_flows), -1, dtype=np.int32)
+        self.idx_rt_plus = np.full((len(self.state_list), n_flows), -1, dtype=np.int32)
+
+        for idx, state in enumerate(self.state_list):
+            for k in range(n_flows):
+                self.idx_rt_minus[idx][k] = self.state_to_idx.get(state.ik_(k, -1), -1)
+                self.idx_rt_plus[idx][k] = self.state_to_idx.get(state.ik_(k, +1), -1)
 
     def precompute_denominator(self):
 
@@ -169,11 +178,11 @@ class Solver:
             )
 
     def precompute_numerator_coefs(self):
-        n = self.params.real_time_flows
+        n_flows = self.params.real_time_flows
         lamb = np.array(self.params.real_time_lambdas)
         mu = np.array(self.params.real_time_mus)
         b = np.array(self.params.real_time_resources)
-        flows_idx = list(range(n))
+        flows_idx = list(range(n_flows))
 
         lambda_e = self.params.data_lambda
         mu_e = self.params.data_mu
@@ -184,15 +193,16 @@ class Solver:
         nu = self.params.retry_intensity
         H = self.params.leave_probability
 
-        self.data_arr_accept_n_coef = [0] * len(self.state_list)
-        self.data_arr_reject_n_coef = [0] * len(self.state_list)
-        self.data_serv_n_coef = [0] * len(self.state_list)
-        self.freeze_n_coef = [0] * len(self.state_list)
-        self.freeze_out_n_coef = [0] * len(self.state_list)
-        self.retry_accept_n_coef = [0] * len(self.state_list)
-        self.retry_reject_n_coef = [0] * len(self.state_list)
-        self.real_time_arr_n_coefs = [[]] * len(self.state_list)
-        self.real_time_serv_n_coefs = [[]] * len(self.state_list)
+        self.data_arr_accept_n_coef = np.zeros(len(self.state_list), dtype=np.float64)
+        self.data_arr_reject_n_coef = np.zeros(len(self.state_list), dtype=np.float64)
+        self.data_serv_n_coef = np.zeros(len(self.state_list), dtype=np.float64)
+        self.freeze_n_coef = np.zeros(len(self.state_list), dtype=np.float64)
+        self.freeze_out_n_coef = np.zeros(len(self.state_list), dtype=np.float64)
+        self.retry_accept_n_coef = np.zeros(len(self.state_list), dtype=np.float64)
+        self.retry_reject_n_coef = np.zeros(len(self.state_list), dtype=np.float64)
+        self.real_time_arr_n_coefs = np.zeros((len(self.state_list), n_flows), dtype=np.float64)
+        self.real_time_serv_n_coefs = np.zeros((len(self.state_list), n_flows), dtype=np.float64)
+
 
         for idx, st in enumerate(self.state_list):
             i_vec, d, r = np.array(st.i_vec), st.d, st.r
@@ -214,10 +224,9 @@ class Solver:
             self.retry_reject_n_coef[idx] = (r + 1) * nu * (1 - H) * (l + d * b_min + b_min > v)
 
             # accept new RT request
-            self.real_time_arr_n_coefs[idx] = [lamb[k] * (i_vec[k] > 0) for k in flows_idx]
+            self.real_time_arr_n_coefs[idx] = np.array([lamb[k] * (i_vec[k] > 0) for k in flows_idx], dtype=np.float64)
             # serve RT request
-            self.real_time_serv_n_coefs[idx] = [(i_vec[k] + 1) * mu[k] * (l + b[k] <= v) for k in flows_idx]
-
+            self.real_time_serv_n_coefs[idx] = np.array([(i_vec[k] + 1) * mu[k] * (l + b[k] <= v) for k in flows_idx], dtype=np.float64)
 
     def get_possible_states(self) -> list[State]:
         """Get possible states for markov process."""
@@ -232,7 +241,8 @@ class Solver:
         retries_states = np.arange(State.r_max, dtype=int)
 
         # product of possible values
-        states = itertools.product(*real_time_flows_states, data_flow_states, retries_states)
+        states = list(itertools.product(*real_time_flows_states, data_flow_states, retries_states))
+        # states.sort(key=lambda s: (-s[1], s[2], s[0]))
         # filter by capacity
         states_lst = [
             State(s[:-2], s[-2], s[-1])
@@ -266,53 +276,56 @@ class Solver:
                 denr = self.denominator[idx]
 
                 # accept new RT request
-                real_time_arr_n = sum(self.prob_of(st.ik_(k, -1)) * self.real_time_arr_n_coefs[idx][k] for k in flows_idx)
-                # serve RT request
-                real_time_serv_n = sum(self.prob_of(st.ik_(k, +1)) * self.real_time_serv_n_coefs[idx][k] for k in flows_idx)
-
-                num = real_time_arr_n + real_time_serv_n
+                num = 0
+                for k in flows_idx:
+                    idx_ = self.idx_rt_minus[idx][k]
+                    if idx_ >= 0:
+                        num += self.p[idx_] * self.real_time_arr_n_coefs[idx][k]
+                    idx_ = self.idx_rt_plus[idx][k]
+                    if idx_ >= 0:
+                        num += self.p[idx_] * self.real_time_serv_n_coefs[idx][k]
 
                 # accept ET request
                 idx_ = self.idx_d_minus_1[idx]
                 if idx_ >= 0:
                     # data_arr_accept_n
-                    num += self.prob_of(self.state_list[idx_]) * self.data_arr_accept_n_coef[idx]
+                    num += self.p[idx_] * self.data_arr_accept_n_coef[idx]
 
                 # reject ET request and it is retried
                 idx_ = self.idx_r_minus_1[idx]
                 if idx_ >= 0:
                     # data_arr_reject_n
-                    num += self.prob_of(self.state_list[idx_]) * self.data_arr_reject_n_coef[idx]
+                    num += self.p[idx_] * self.data_arr_reject_n_coef[idx]
 
                 # serve ET request
                 idx_ = self.idx_d_plus_1[idx]
                 if idx_ >= 0:
                     # data_serv_n
-                    num += self.prob_of(self.state_list[idx_]) * self.data_serv_n_coef[idx]
+                    num += self.p[idx_] * self.data_serv_n_coef[idx]
 
                 # go to retries from freeze queue
                 idx_ = self.idx_d_plus_1_r_minus_1[idx]
                 if idx_ >= 0:
                     # freeze_n
-                    num += self.prob_of(self.state_list[idx_]) * self.freeze_n_coef[idx]
+                    num += self.p[idx_] * self.freeze_n_coef[idx]
 
                 # go out of the system from freeze queue
                 idx_ = self.idx_d_plus_1[idx]
                 if idx_ >= 0:
                     # freeze_out_n
-                    num += self.prob_of(self.state_list[idx_]) * self.freeze_out_n_coef[idx]
+                    num += self.p[idx_] * self.freeze_out_n_coef[idx]
 
                 # accept retry request
                 idx_ = self.idx_d_minus_1_r_plus_1[idx]
                 if idx_ >= 0:
                     # retry_accept_n
-                    num += self.prob_of(self.state_list[idx_]) * self.retry_accept_n_coef[idx]
+                    num += self.p[idx_] * self.retry_accept_n_coef[idx]
 
                 # reject retry request and it leaves the system
                 idx_ = self.idx_r_plus_1[idx]
                 if idx_ >= 0:
                     # retry_reject_n
-                    num += self.prob_of(self.state_list[idx_]) * self.retry_reject_n_coef[idx]
+                    num += self.p[idx_] * self.retry_reject_n_coef[idx]
 
                 prev_prob = self.p[idx]
                 error += abs(prev_prob - num / denr) / prev_prob
