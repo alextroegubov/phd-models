@@ -92,20 +92,84 @@ class Solver:
             [max(0, state.d + 1 - (v - l) // b_min) for state, l in zip(self.state_list, self.l_arr)]
         )
 
-        self.idx_d_plus_1 = np.full(len(self.state_list), -1, dtype=np.int32)
-        self.idx_d_minus_1 = np.full(len(self.state_list), -1, dtype=np.int32)
-        self.idx_r_plus_1 = np.full(len(self.state_list), -1, dtype=np.int32)
-        self.idx_r_minus_1 = np.full(len(self.state_list), -1, dtype=np.int32)
-        self.idx_d_plus_1_r_minus_1 = np.full(len(self.state_list), -1, dtype=np.int32)
-        self.idx_d_minus_1_r_plus_1 = np.full(len(self.state_list), -1, dtype=np.int32)
+        self.idx_d_plus_1 = np.array(
+            [self.state_to_idx.get(state.d_(1), -1) for state in self.state_list], dtype=np.int32
+        )
 
-        for idx, state in enumerate(self.state_list):
-            self.idx_d_plus_1[idx] = self.state_to_idx.get(state.d_(1), -1)
-            self.idx_d_minus_1[idx] = self.state_to_idx.get(state.d_(-1), -1)
-            self.idx_r_plus_1[idx] = self.state_to_idx.get(state.r_(1), -1)
-            self.idx_r_minus_1[idx] = self.state_to_idx.get(state.r_(-1), -1)
-            self.idx_d_plus_1_r_minus_1[idx] = self.state_to_idx.get(state.dr_(d_d=1, d_r=-1), -1)
-            self.idx_d_minus_1_r_plus_1[idx] = self.state_to_idx.get(state.dr_(d_d=-1, d_r=1), -1)
+        self.idx_d_minus_1 = np.array(
+            [self.state_to_idx.get(state.d_(-1), -1) for state in self.state_list], dtype=np.int32
+        )
+
+
+        self.idx_r_plus_1 = np.array(
+            [self.state_to_idx.get(state.r_(1), -1) for state in self.state_list], dtype=np.int32
+        )
+
+        self.idx_r_minus_1 = np.array(
+            [self.state_to_idx.get(state.r_(-1), -1) for state in self.state_list], dtype=np.int32
+        )
+
+        self.idx_d_plus_1_r_minus_1 = np.array(
+            [self.state_to_idx.get(state.dr_(d_d=1, d_r=-1), -1) for state in self.state_list], dtype=np.int32
+        )
+
+        self.idx_d_minus_1_r_plus_1 = np.array(
+            [self.state_to_idx.get(state.dr_(d_d=-1, d_r=1), -1) for state in self.state_list], dtype=np.int32
+        )
+
+
+    def precompute_denominator(self):
+
+        n = self.params.real_time_flows
+        lamb = np.array(self.params.real_time_lambdas)
+        mu = np.array(self.params.real_time_mus)
+        b = np.array(self.params.real_time_resources)
+
+        lambda_e = self.params.data_lambda
+        mu_e = self.params.data_mu
+        b_min = self.params.data_resources_min
+
+        v = self.params.beam_capacity
+        sigma = self.params.queue_intensity
+        nu = self.params.retry_intensity
+        H = self.params.leave_probability
+
+        self.denominator = np.full(len(self.state_list), 0, dtype=np.float32)
+
+        for idx, st in enumerate(self.state_list):
+            i_vec, d, r = np.array(st.i_vec), st.d, st.r
+            l = self.l_arr[idx]
+            q = self.q_arr[idx]
+            # accept new RT request
+            real_time_arrival_d = sum(lamb[k] * (l + b[k] <= v) for k in range(n))
+            # serve RT request
+            real_time_serv_d = sum(i_vec[k] * mu[k] * (i_vec[k] > 0) for k in range(n))
+
+            # accept ET request
+            data_arr_accept_d = lambda_e * (l + d * b_min + b_min <= v)
+            # reject ET request and it is retried
+            data_arr_reject_d = lambda_e * H * (l + d * b_min + b_min > v)
+
+            # serve ET request
+            data_serv_d = mu_e * (v - l) * (d - q > 0)
+            # go to retries from freeze queue
+            freeze_d = q * sigma * (q > 0)
+
+            # accept retry request
+            retry_accept_d = r * nu * (l + d * b_min + b_min <= v)
+            # reject retry request and it leaves the system
+            retry_reject_d = r * nu * (1 - H) * (l + d * b_min + b_min > v)
+
+            self.denominator[idx] = (
+                real_time_arrival_d
+                + real_time_serv_d
+                + data_arr_accept_d
+                + data_arr_reject_d
+                + data_serv_d
+                + freeze_d
+                + retry_accept_d
+                + retry_reject_d
+            )
 
     def get_possible_states(self) -> list[State]:
         """Get possible states for markov process."""
@@ -155,6 +219,8 @@ class Solver:
         start_time = time.time()
 
         self.preprocess()
+        self.precompute_denominator()
+
         while error > self.max_eps and iteration < self.max_iter:
             iteration += 1
             error = 0
@@ -164,37 +230,9 @@ class Solver:
                 l = self.l_arr[idx]
                 q = self.q_arr[idx]
                 q_prime = self.q_prime_arr[idx]
-                # accept new RT request
-                real_time_arrival_d = sum(lamb[k] * (l + b[k] <= v) for k in range(n))
-                # serve RT request
-                real_time_serv_d = sum(i_vec[k] * mu[k] * (i_vec[k] > 0) for k in range(n))
-
-                # accept ET request
-                data_arr_accept_d = lambda_e * (l + d * b_min + b_min <= v)
-                # reject ET request and it is retried
-                data_arr_reject_d = lambda_e * H * (l + d * b_min + b_min > v)
-
-                # serve ET request
-                data_serv_d = mu_e * (v - l) * (d - q > 0)
-                # go to retries from freeze queue
-                freeze_d = q * sigma * (q > 0)
-
-                # accept retry request
-                retry_accept_d = r * nu * (l + d * b_min + b_min <= v)
-                # reject retry request and it leaves the system
-                retry_reject_d = r * nu * (1 - H) * (l + d * b_min + b_min > v)
 
                 # denominator
-                denr = (
-                    real_time_arrival_d
-                    + real_time_serv_d
-                    + data_arr_accept_d
-                    + data_arr_reject_d
-                    + data_serv_d
-                    + freeze_d
-                    + retry_accept_d
-                    + retry_reject_d
-                )
+                denr = self.denominator[idx]
 
                 # accept new RT request
                 real_time_arr_n = sum(self.prob_of(st.ik_(k, -1)) * lamb[k] * (i_vec[k] > 0) for k in flows_idx)
@@ -240,7 +278,10 @@ class Solver:
                 if idx_ >= 0:
                     # retry_accept_n
                     num += (
-                        (r + 1) * nu * self.prob_of(st.dr_(d_d=-1, d_r=1)) * (d > 0 and l + (d - 1) * b_min + b_min <= v)
+                        (r + 1)
+                        * nu
+                        * self.prob_of(st.dr_(d_d=-1, d_r=1))
+                        * (d > 0 and l + (d - 1) * b_min + b_min <= v)
                     )
                 # reject retry request and it leaves the system
                 idx_ = self.idx_r_plus_1[idx]
