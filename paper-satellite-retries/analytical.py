@@ -173,6 +173,7 @@ class Solver:
         lamb = np.array(self.params.real_time_lambdas)
         mu = np.array(self.params.real_time_mus)
         b = np.array(self.params.real_time_resources)
+        flows_idx = list(range(n))
 
         lambda_e = self.params.data_lambda
         mu_e = self.params.data_mu
@@ -190,6 +191,8 @@ class Solver:
         self.freeze_out_n_coef = [0] * len(self.state_list)
         self.retry_accept_n_coef = [0] * len(self.state_list)
         self.retry_reject_n_coef = [0] * len(self.state_list)
+        self.real_time_arr_n_coefs = [[]] * len(self.state_list)
+        self.real_time_serv_n_coefs = [[]] * len(self.state_list)
 
         for idx, st in enumerate(self.state_list):
             i_vec, d, r = np.array(st.i_vec), st.d, st.r
@@ -209,6 +212,12 @@ class Solver:
             self.retry_accept_n_coef[idx] = (r + 1) * nu * (d > 0 and l + (d - 1) * b_min + b_min <= v)
 
             self.retry_reject_n_coef[idx] = (r + 1) * nu * (1 - H) * (l + d * b_min + b_min > v)
+
+            # accept new RT request
+            self.real_time_arr_n_coefs[idx] = [lamb[k] * (i_vec[k] > 0) for k in flows_idx]
+            # serve RT request
+            self.real_time_serv_n_coefs[idx] = [(i_vec[k] + 1) * mu[k] * (l + b[k] <= v) for k in flows_idx]
+
 
     def get_possible_states(self) -> list[State]:
         """Get possible states for markov process."""
@@ -236,19 +245,6 @@ class Solver:
     def solve(self):
         """Solve the model."""
         n = self.params.real_time_flows
-        lamb = np.array(self.params.real_time_lambdas)
-        mu = np.array(self.params.real_time_mus)
-        b = np.array(self.params.real_time_resources)
-
-        lambda_e = self.params.data_lambda
-        mu_e = self.params.data_mu
-        b_min = self.params.data_resources_min
-
-        v = self.params.beam_capacity
-        sigma = self.params.queue_intensity
-        nu = self.params.retry_intensity
-        H = self.params.leave_probability
-
         flows_idx = list(range(n))
 
         error = 1000
@@ -266,19 +262,13 @@ class Solver:
             error = 0
 
             for idx, st in enumerate(self.state_list):
-                i_vec, d, r = np.array(st.i_vec), st.d, st.r
-                l = self.l_arr[idx]
-                q_prime = self.q_prime_arr[idx]
-
                 # denominator
                 denr = self.denominator[idx]
 
                 # accept new RT request
-                real_time_arr_n = sum(self.prob_of(st.ik_(k, -1)) * lamb[k] * (i_vec[k] > 0) for k in flows_idx)
+                real_time_arr_n = sum(self.prob_of(st.ik_(k, -1)) * self.real_time_arr_n_coefs[idx][k] for k in flows_idx)
                 # serve RT request
-                real_time_serv_n = sum(
-                    self.prob_of(st.ik_(k, +1)) * (i_vec[k] + 1) * mu[k] * (l + b[k] <= v) for k in flows_idx
-                )
+                real_time_serv_n = sum(self.prob_of(st.ik_(k, +1)) * self.real_time_serv_n_coefs[idx][k] for k in flows_idx)
 
                 num = real_time_arr_n + real_time_serv_n
 
@@ -481,8 +471,6 @@ def main():
     print(len(solver.state_list))
     it, error = solver.solve()
     logger.info("Final: it=%d, error=%2.10f", it, error)
-
-    # metrics, it, error = solver.solve()
 
 
 if __name__ == "__main__":
