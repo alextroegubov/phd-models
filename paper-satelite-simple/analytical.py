@@ -8,6 +8,7 @@ import itertools
 import time
 from dataclasses import dataclass
 import numpy as np
+from numba import njit
 from utils import ParametersSet, Metrics
 
 logger = logging.getLogger(__name__)
@@ -51,11 +52,13 @@ class Solver:
 
         logger.info("%s", self.params)
 
-        self.states: dict[Solver.State, float] = {
-            state: 1e-2 for state in self.get_possible_states()
+        self.state_list: list[Solver.State] = self.get_possible_states()
+        self.state_to_idx: dict[Solver.State, int] = {
+            state: idx for idx, state in enumerate(self.state_list)
         }
+        self.p: np.ndarray = np.full(len(self.state_list), 1e-2, dtype=np.float64)
 
-        logger.info("Number of states: %d", len(self.states))
+        logger.info("Number of states: %d", len(self.state_list))
 
     def get_possible_states(self) -> list[State]:
         """Get possible states for markov process."""
@@ -80,86 +83,141 @@ class Solver:
 
         return states_lst
 
-    def solve(self):
-        """Solve the model."""
+    def precompute_state_indices(self):
+        """Precompute state neighbor indices for fast array-based lookup."""
+        n_flows = self.params.real_time_flows
+        S = len(self.params.data_requests_batch_probs)
+        index_of = lambda state: self.state_to_idx.get(state, -1)
+
+        self.idx_d_plus_1 = np.array(
+            [index_of(st.d_(+1)) for st in self.state_list], dtype=np.int32
+        )
+        self.idx_d_minus_s = np.array(
+            [[index_of(st.d_(-s)) for s in range(1, S + 1)] for st in self.state_list],
+            dtype=np.int32,
+        )
+        self.idx_rt_minus = np.array(
+            [[index_of(st.ik_(k, -1)) for k in range(n_flows)] for st in self.state_list],
+            dtype=np.int32,
+        )
+        self.idx_rt_plus = np.array(
+            [[index_of(st.ik_(k, +1)) for k in range(n_flows)] for st in self.state_list],
+            dtype=np.int32,
+        )
+
+    def precompute_denominator(self):
+        """Precompute denominator for the Gauss-Seidel equation for each state."""
         n = self.params.real_time_flows
         lamb = np.array(self.params.real_time_lambdas)
         mu = np.array(self.params.real_time_mus)
         b = np.array(self.params.real_time_resources)
-
         b_min = self.params.data_resources_min
         b_max = self.params.data_resources_max
         lambda_e = self.params.data_lambda
         mu_e = self.params.data_mu
-        # f[0] = f_1 -> f_s = f[s-1]
-        f = self.params.data_requests_batch_probs
-
         v = self.params.beam_capacity
+        rt_resources = np.array(self.params.real_time_resources)
 
-        flows_idx = list(range(n))
+        n_states = len(self.state_list)
+        self.denominator = np.zeros(n_states, dtype=np.float64)
+        self.l_arr = np.zeros(n_states, dtype=np.float64)
 
-        error = 1000
-        iteration = 0
+        for idx, st in enumerate(self.state_list):
+            i_vec = np.array(st.i_vec)
+            d = st.d
 
+            l = np.dot(i_vec, rt_resources)
+            l_tot = l + d * b_min
+            self.l_arr[idx] = l
+
+            rt_arrival_d = sum(lamb[k] * (l_tot + b[k] <= v) for k in range(n))
+            rt_serv_d = sum(i_vec[k] * mu[k] for k in range(n))
+            data_arr_d = lambda_e * (l_tot + b_min <= v)
+            data_serv_d = mu_e / b_min * (d > 0) * min(v - l, d * b_max)
+
+            self.denominator[idx] = rt_arrival_d + rt_serv_d + data_arr_d + data_serv_d
+
+    def precompute_numerator_coefs(self):
+        """Precompute numerator coefficients for the Gauss-Seidel equation."""
+        n = self.params.real_time_flows
+        lamb = np.array(self.params.real_time_lambdas)
+        mu = np.array(self.params.real_time_mus)
+        b = np.array(self.params.real_time_resources)
+        b_min = self.params.data_resources_min
+        b_max = self.params.data_resources_max
+        lambda_e = self.params.data_lambda
+        mu_e = self.params.data_mu
+        v = self.params.beam_capacity
+        f = np.array(self.params.data_requests_batch_probs)
+        S = len(f)
+        rt_resources = np.array(self.params.real_time_resources)
+
+        n_states = len(self.state_list)
+        self.real_time_arr_n_coefs = np.zeros((n_states, n), dtype=np.float64)
+        self.real_time_serv_n_coefs = np.zeros((n_states, n), dtype=np.float64)
+        self.data_arr_n_coefs = np.zeros((n_states, S), dtype=np.float64)
+        self.data_serv_n_coef = np.zeros(n_states, dtype=np.float64)
+
+        f_tail_sums = np.zeros(S, dtype=np.float64)
+        for s_idx in range(S):
+            f_tail_sums[s_idx] = np.sum(f[s_idx + 1:]) if s_idx + 1 < S else 0.0
+
+        for idx, st in enumerate(self.state_list):
+            i_vec = np.array(st.i_vec)
+            d = st.d
+            l = self.l_arr[idx]
+            l_tot = l + d * b_min
+
+            for k in range(n):
+                self.real_time_arr_n_coefs[idx, k] = lamb[k] * (i_vec[k] > 0)
+                self.real_time_serv_n_coefs[idx, k] = (i_vec[k] + 1) * mu[k] * (l_tot + b[k] <= v)
+
+            for s_idx in range(S):
+                s = s_idx + 1
+                if s <= d:
+                    self.data_arr_n_coefs[idx, s_idx] = lambda_e * (
+                        f[s_idx] + (v - l_tot < b_min) * f_tail_sums[s_idx]
+                    )
+
+            d_plus_1 = d + 1
+            l_tot_plus_1 = l + d_plus_1 * b_min
+            self.data_serv_n_coef[idx] = (
+                mu_e / b_min
+                * min(v - l, b_max * d_plus_1)
+                * (l_tot_plus_1 <= v and d_plus_1 > 0)
+            )
+
+    def solve(self):
+        """Solve the model."""
         logger.info("Start solving the model")
         start_time = time.time()
-        while error > self.max_eps and iteration < self.max_iter:
-            iteration += 1
-            error = 0
 
-            for st, prev_prob in self.states.items():
-                i_vec, d = st.i_vec, st.d
-                i_vec = np.array(i_vec)
+        self.precompute_state_indices()
+        self.precompute_denominator()
+        self.precompute_numerator_coefs()
 
-                l = np.dot(i_vec, b)
-                l_tot = l + d * b_min
-
-                real_time_arrival_d = sum(lamb[k] * (l_tot + b[k] <= v) for k in range(n))
-                real_time_serv_d = sum(i_vec[k] * mu[k] * (i_vec[k] > 0) for k in range(n))
-
-                data_arr_d = lambda_e * (l_tot + b_min <= v)
-                data_serv_d = mu_e / b_min * (d > 0) * min(v - l, d * b_max)
-
-                denr = real_time_arrival_d + real_time_serv_d + data_arr_d + data_serv_d
-
-                real_time_arr_n = sum(
-                    self.states.get(st.ik_(k, -1), 0) * lamb[k] * (i_vec[k] > 0) for k in flows_idx
-                )
-                real_time_serv_n = sum(
-                    self.states.get(st.ik_(k, +1), 0) * (i_vec[k] + 1) * mu[k] * (l_tot + b[k] <= v)
-                    for k in range(n)
-                )
-                data_arr_n = sum(
-                    [self.states.get(st.d_(-s), 0) * lambda_e * (f[s-1] + (v - l_tot < b_min) * sum(f[s:]))
-                    for s in range(1, min(d, len(f)) + 1)]
-                )
-                data_serv_n = (
-                    self.states.get(st.d_(+1), 0.0)
-                    * (l_tot + b_min <= v and d + 1 > 0)
-                    * mu_e
-                    / b_min
-                    * min(v - l, b_max * (d + 1))
-                )
-
-                numr = real_time_arr_n + real_time_serv_n + data_arr_n + data_serv_n
-                error += abs(prev_prob - numr / denr) / prev_prob
-                self.states[st] = numr / denr
-
-            if iteration % 500 == 0:
-                logger.info(
-                    "Iteration %d: error = %2.8f, time = %4.2f",
-                    iteration,
-                    error,
-                    time.time() - start_time,
-                )
+        iteration, error = solve_numba(
+            self.p,
+            self.max_eps,
+            self.max_iter,
+            self.denominator,
+            self.idx_rt_minus,
+            self.idx_rt_plus,
+            self.idx_d_minus_s,
+            self.idx_d_plus_1,
+            self.real_time_arr_n_coefs,
+            self.real_time_serv_n_coefs,
+            self.data_arr_n_coefs,
+            self.data_serv_n_coef,
+        )
 
         logger.info(
             "Model solved in %d iterations for %4.2f sec", iteration, time.time() - start_time
         )
-        norm = sum(self.states.values())
 
-        for key, value in self.states.items():
-            self.states[key] = value / norm
+        self.p = self.p / self.p.sum()
+
+        self.states = {st: self.p[idx] for idx, st in enumerate(self.state_list)}
 
         metrics = self.calculate_metrics()
         logger.info("%s", metrics)
@@ -257,6 +315,63 @@ class Solver:
                 k,
                 np.isclose(lambda_k * (1 - pi_k) * b_k, m_k * mu_k),
             )
+
+
+@njit(cache=True)
+def solve_numba(
+    p,
+    max_eps,
+    max_iter,
+    denominator,
+    idx_rt_minus,
+    idx_rt_plus,
+    idx_d_minus_s,
+    idx_d_plus_1,
+    real_time_arr_n_coefs,
+    real_time_serv_n_coefs,
+    data_arr_n_coefs,
+    data_serv_n_coef,
+):
+    iteration = 0
+    error = 1e10
+    n_states = p.shape[0]
+    n_flows = idx_rt_minus.shape[1]
+    n_batch = idx_d_minus_s.shape[1]
+
+    while error > max_eps and iteration < max_iter:
+        iteration += 1
+        max_diff = 0.0
+
+        for idx in range(n_states):
+            num = 0.0
+
+            for k in range(n_flows):
+                j = idx_rt_minus[idx, k]
+                if j >= 0:
+                    num += p[j] * real_time_arr_n_coefs[idx, k]
+
+                j = idx_rt_plus[idx, k]
+                if j >= 0:
+                    num += p[j] * real_time_serv_n_coefs[idx, k]
+
+            for s_idx in range(n_batch):
+                j = idx_d_minus_s[idx, s_idx]
+                if j >= 0:
+                    num += p[j] * data_arr_n_coefs[idx, s_idx]
+
+            j = idx_d_plus_1[idx]
+            if j >= 0:
+                num += p[j] * data_serv_n_coef[idx]
+
+            new_prob = num / denominator[idx]
+            diff = abs(new_prob - p[idx])
+            if diff > max_diff:
+                max_diff = diff
+            p[idx] = new_prob
+
+        error = max_diff
+
+    return iteration, error
 
 
 def get_argparser():
