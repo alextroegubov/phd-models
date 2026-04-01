@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -14,8 +14,6 @@ class ParametersSet:
 
     # b_min
     data_resources_min: int
-    # b_max
-    data_resources_max: int
     # lambda_e
     data_lambda: float
     # mu_e
@@ -26,7 +24,7 @@ class ParametersSet:
     # nu
     retry_intensity: float
     # H
-    leave_probability: float
+    retry_probability: float
 
     # v
     beam_capacity: int
@@ -48,47 +46,128 @@ class ParametersSet:
             f"  Real-Time Flows: {self.real_time_flows}\n"
             f"  {real_time_params}\n"
             f"  Elastic Data Flow\n"
-            f"    λ = {self.data_lambda:.5f}\n"
-            f"    μ = {self.data_mu:.5f}\n"
-            f"    sigma = {self.queue_intensity:.5f}\n"
-            f"    nu = {self.retry_intensity:.5f}\n"
-            f"    H = {self.leave_probability:.5f}\n"
+            f"    b_min = {self.data_resources_min}\n"
+            f"    λ_e = {self.data_lambda:.5f}\n"
+            f"    μ_e = {self.data_mu:.5f}\n"
+            f"    σ = {self.queue_intensity:.5f}\n"
+            f"    ν = {self.retry_intensity:.5f}\n"
+            f"    H = {self.retry_probability:.5f}\n"
         )
 
 
 @dataclass
 class Metrics:
     # pi_k, k=1,...,n
-    rt_request_rej_prob: list[float]
+    rt_request_rej_prob: list[float] = field(default_factory=list)
     # y_k, k=1,...n
-    mean_rt_requests_in_service: list[float]
+    mean_rt_requests_in_service: list[float] = field(default_factory=list)
     # m_k, k=1,...n
-    mean_resources_per_rt_flow: list[float]
+    mean_resources_per_rt_flow: list[float] = field(default_factory=list)
 
     # y_r
     mean_retry_requests: float = 0
     # y_q
     mean_freeze_requests: float = 0
-    # Lambda_b
-    intensity_blocked_requests: float = 0
+    # y_d
+    mean_data_requests_in_system: float = 0
+    # y_e
+    mean_data_requests_in_service: float = 0
 
     # m_e
     mean_resources_per_data_flow: float = 0
-    # Lambda
-    intensity_all_requests: float = 0
-
-    # # pi_e
-    # data_request_rej_prob: float = 0
-    # y_e
-    mean_data_requests_in_service: float = 0
-    # # W
-    # mean_data_request_service_time: float = 0
     # b_e
     mean_resources_per_data_request: float = 0
+    # Lambda_e
+    intensity_all_requests: float = 0
+    # Lambda_e,b
+    intensity_blocked_requests: float = 0
 
+    # pi_e,0
+    primary_data_request_reject_prob: float = 0
+    # pi_e,a
+    data_request_attempt_reject_prob: float = 0
+    # pi_e,r
+    data_request_not_serviced_prob: float = 0
+
+    # W_sess
+    mean_data_request_in_system_time: float = 0
+    # A
+    retry_amplification_factor: float = 0
+
+    # v
     beam_utilization: float = 0
 
+    # caption
     text: str = ""
+
+    @property
+    def pi_k(self) -> list[float]:
+        return self.rt_request_rej_prob
+
+    @property
+    def y_k(self) -> list[float]:
+        return self.mean_rt_requests_in_service
+
+    @property
+    def m_k(self) -> list[float]:
+        return self.mean_resources_per_rt_flow
+
+    @property
+    def y_r(self) -> float:
+        return self.mean_retry_requests
+
+    @property
+    def y_q(self) -> float:
+        return self.mean_freeze_requests
+
+    @property
+    def y_d(self) -> float:
+        return self.mean_data_requests_in_system
+
+    @property
+    def y_e(self) -> float:
+        return self.mean_data_requests_in_service
+
+    @property
+    def m_e(self) -> float:
+        return self.mean_resources_per_data_flow
+
+    @property
+    def b_e(self) -> float:
+        return self.mean_resources_per_data_request
+
+    @property
+    def Lambda_e(self) -> float:
+        return self.intensity_all_requests
+
+    @property
+    def Lambda_e_b(self) -> float:
+        return self.intensity_blocked_requests
+
+    @property
+    def pi_e_0(self) -> float:
+        return self.primary_data_request_reject_prob
+
+    @property
+    def pi_e_a(self) -> float:
+        return self.data_request_attempt_reject_prob
+
+    @property
+    def pi_e_r(self) -> float:
+        return self.data_request_not_serviced_prob
+
+    @property
+    def W_sess(self) -> float:
+        return self.mean_data_request_in_system_time
+
+    @property
+    def A(self) -> float:
+        return self.retry_amplification_factor
+
+    @property
+    def util(self) -> float:
+        return self.beam_utilization
+
 
     def __str__(self):
         def f_lst_5f(lst):
@@ -106,9 +185,17 @@ class Metrics:
             f"      Mean requests in service    : [{f_lst_3f(self.mean_rt_requests_in_service)}]\n"
             f"      Mean resources per flow     : [{f_lst_3f(self.mean_resources_per_rt_flow)}]\n"
             f"  Elastic data flow:\n"
-            # f"      Request rejection prob.     : {self.data_request_rej_prob:.4f}\n"
-            f"      Mean requests in Service    : {self.mean_data_requests_in_service:.4f}\n"
-            # f"      Mean resources per flow     : {self.mean_resources_per_data_flow:.4f}\n"
+            f"      Mean retry requests         : {self.mean_retry_requests:.4f}\n"
+            f"      Mean freeze requests        : {self.mean_freeze_requests:.4f}\n"
+            f"      Mean requests in system     : {self.mean_data_requests_in_system:.4f}\n"
+            f"      Mean requests in service    : {self.mean_data_requests_in_service:.4f}\n"
+            f"      Mean resources per flow     : {self.mean_resources_per_data_flow:.4f}\n"
             f"      Mean resources per request  : {self.mean_resources_per_data_request:.4f}\n"
-            # f"      Mean request service time   : {self.mean_data_request_service_time:.4f}\n"
+            f"      Primary reject prob.        : {self.primary_data_request_reject_prob:.5f}\n"
+            f"      Attempt reject prob.        : {self.data_request_attempt_reject_prob:.5f}\n"
+            f"      Not serviced prob.          : {self.data_request_not_serviced_prob:.5f}\n"
+            f"      Mean time in system         : {self.mean_data_request_in_system_time:.4f}\n"
+            f"      Retry amplification factor   : {self.retry_amplification_factor:.4f}\n"
+            f"      Intensity of all requests    : {self.intensity_all_requests:.4f}\n"
+            f"      Intensity of blocked requests: {self.intensity_blocked_requests:.4f}\n"
         )

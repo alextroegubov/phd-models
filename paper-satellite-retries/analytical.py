@@ -12,7 +12,7 @@ from numba import njit
 from typing import ClassVar
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(filename="analytical.log", filemode="w", level=logging.INFO, encoding="utf-8")
+# logging.basicConfig(filename="analytical.log", filemode="w", level=logging.INFO, encoding="utf-8")
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,13 +64,13 @@ class Solver:
         self.max_eps: float = max_eps
         self.max_iter: int = max_iter
 
-        logger.info("%s", self.params)
-
+    def init_state_list(self, r_max: int = 20):
+        State.r_max = r_max
         self.state_list = self.get_possible_states()
         self.state_to_idx = {state: idx for idx, state in enumerate(self.state_list)}
         self.p = np.full(len(self.state_list), 1e-2, dtype=np.float64)
 
-        logger.info("Number of states: %d", len(self.state_list))
+        logger.info("Init solver: r_max=%d, number of states: %d", r_max, len(self.state_list))
 
     def precompute_state_indices(self):
         """Precompute state indices for faster access during the iterations"""
@@ -118,7 +118,7 @@ class Solver:
         v = self.params.beam_capacity
         sigma = self.params.queue_intensity
         nu = self.params.retry_intensity
-        H = self.params.leave_probability
+        H = self.params.retry_probability
 
         self.denominator = np.zeros(len(self.state_list), dtype=np.float64)
 
@@ -186,7 +186,7 @@ class Solver:
         v = self.params.beam_capacity
         sigma = self.params.queue_intensity
         nu = self.params.retry_intensity
-        H = self.params.leave_probability
+        H = self.params.retry_probability
 
         self.data_arr_accept_n_coef = np.zeros(len(self.state_list), dtype=np.float64)
         self.data_arr_reject_n_coef = np.zeros(len(self.state_list), dtype=np.float64)
@@ -245,6 +245,26 @@ class Solver:
 
         return states_lst
 
+    def solve_with_r_max(self, r_min: int, step: int, max_attempts: int) -> bool:
+        """Solve the model with different r_max values."""
+        is_valid = False
+        attempt = 0
+        while not is_valid and attempt < max_attempts:
+            logger.info("--------------------------------")
+            logger.info("Attempt %d", attempt)
+            self.init_state_list(r_min + attempt * step)
+            logger.info("\tNumber of states: %d", len(self.state_list))
+            it, error = self.solve()
+            logger.info("\tFinal: it=%d, error=%2.10f", it, error)
+
+            metrics = self.calculate_metrics()
+            logger.info("\t%s", metrics)
+            is_valid = self.check_solution(metrics)
+            logger.info("\tSolution is valid: %s", is_valid)
+            attempt += 1
+
+        return bool(is_valid)
+
     def solve(self):
         """Solve the model."""
         logger.info("Start solving the model")
@@ -286,11 +306,6 @@ class Solver:
 
         self.p = self.p / self.p.sum()
 
-        metrics = self.calculate_metrics()
-        logger.info("%s", metrics)
-
-        self.check_solution(metrics)
-
         return iteration, error
 
     def calculate_metrics(self) -> Metrics:
@@ -298,104 +313,124 @@ class Solver:
 
         rt_flows = self.params.real_time_flows
 
-        metrics = Metrics(
-            rt_request_rej_prob=[0] * rt_flows,
-            mean_rt_requests_in_service=[0] * rt_flows,
-            mean_resources_per_rt_flow=[0] * rt_flows,
-        )
-
         v = self.params.beam_capacity
         lambda_e = self.params.data_lambda
         nu = self.params.retry_intensity
+        sigma = self.params.queue_intensity
         b_min = self.params.data_resources_min
+        H = self.params.retry_probability
+        mu_e = self.params.data_mu
 
         d_arr = np.array([state.d for state in self.state_list], dtype=np.int32)
         r_arr = np.array([state.r for state in self.state_list], dtype=np.int32)
         i_vec_arr = np.array([np.array(state.i_vec, dtype=np.int32) for state in self.state_list], dtype=np.int32)
 
-        for k in range(rt_flows):
-            b_k = self.params.real_time_resources[k]
+        b_k = self.params.real_time_resources
+        pi_k = [np.sum(self.p * (self.l_arr + b_k[k] > v)) for k in range(rt_flows)]
+        y_k = [np.sum(self.p * i_vec_arr[:, k]) for k in range(rt_flows)]
+        m_k = [y_k[k] * b_k[k] for k in range(rt_flows)]
 
-            metrics.mean_rt_requests_in_service[k] = np.sum(self.p * i_vec_arr[:, k])
-            metrics.rt_request_rej_prob[k] = np.sum(self.p * (self.l_arr + b_k > v))
-            metrics.mean_resources_per_rt_flow[k] = (
-                metrics.mean_rt_requests_in_service[k] * self.params.real_time_resources[k]
-            )
+        y_r = np.sum(self.p * r_arr)
+        y_q = np.sum(self.p * self.q_arr)
+        y_d = np.sum(self.p * d_arr)
 
-        metrics.mean_freeze_requests = np.sum(self.p * self.q_arr)
-        metrics.mean_retry_requests = np.sum(self.p * r_arr)
-        metrics.mean_resources_per_data_flow = np.sum(self.p * (v - self.l_arr) * (d_arr - self.q_arr > 0))
-        metrics.mean_data_requests_in_service = np.sum(self.p * (d_arr - self.q_arr) * (d_arr - self.q_arr > 0))
+        y_e = np.sum(self.p * (d_arr - self.q_arr) * (d_arr - self.q_arr > 0))
+        m_e = np.sum(self.p * (v - self.l_arr) * (d_arr - self.q_arr > 0))
+        b_e = m_e / y_e
 
-        metrics.intensity_blocked_requests = np.sum(
-            self.p * (lambda_e + r_arr * nu) * (self.l_arr + d_arr * b_min + b_min > v)
+        Lambda_e_b = np.sum(self.p * (lambda_e + r_arr * nu) * (self.l_arr + d_arr * b_min + b_min > v))
+        Lambda_e = lambda_e + y_r * nu
+
+        pi_e_0 = np.sum(self.p * (self.l_arr + (d_arr + 1) * b_min > v))
+        pi_e_a = Lambda_e_b / Lambda_e
+        pi_e_r = (1 - H) * (Lambda_e_b + y_q * sigma) / lambda_e
+        W_sess = np.sum(self.p * d_arr) / (m_e * mu_e + y_q * sigma)
+        A = Lambda_e / lambda_e
+
+        util = sum(m_k) + m_e
+
+        return Metrics(
+            rt_request_rej_prob=[float(x) for x in pi_k],
+            mean_rt_requests_in_service=[float(x) for x in y_k],
+            mean_resources_per_rt_flow=[float(x) for x in m_k],
+            mean_retry_requests=float(y_r),
+            mean_freeze_requests=float(y_q),
+            mean_data_requests_in_system=float(y_d),
+            mean_data_requests_in_service=float(y_e),
+            mean_resources_per_data_flow=float(m_e),
+            mean_resources_per_data_request=float(b_e),
+            intensity_all_requests=float(Lambda_e),
+            intensity_blocked_requests=float(Lambda_e_b),
+            primary_data_request_reject_prob=float(pi_e_0),
+            data_request_attempt_reject_prob=float(pi_e_a),
+            data_request_not_serviced_prob=float(pi_e_r),
+            mean_data_request_in_system_time=float(W_sess),
+            retry_amplification_factor=float(A),
+            beam_utilization=float(util),
         )
-
-        metrics.intensity_all_requests = lambda_e + metrics.mean_retry_requests * nu
-
-        metrics.mean_resources_per_data_request = (
-            metrics.mean_resources_per_data_flow / metrics.mean_data_requests_in_service
-        )
-
-        metrics.beam_utilization = sum(metrics.mean_resources_per_rt_flow) + metrics.mean_resources_per_data_flow
-        return metrics
 
     def check_solution(self, metrics: Metrics):
         """Check the solution."""
 
         # real-time traffic flows
+        real_time_balances = []
         for k in range(self.params.real_time_flows):
             lambda_k = self.params.real_time_lambdas[k]
             mu_k = self.params.real_time_mus[k]
             b_k = self.params.real_time_resources[k]
 
-            pi_k = metrics.rt_request_rej_prob[k]
-            m_k = metrics.mean_resources_per_rt_flow[k]
-
+            pi_k = metrics.pi_k[k]
+            m_k = metrics.m_k[k]
+            real_time_balance_k = np.isclose(lambda_k * (1 - pi_k) * b_k, m_k * mu_k)
+            real_time_balances.append(real_time_balance_k)
             logger.info(
                 "Real-time flow %d balance (%2.5f, %2.5f): %s",
                 k,
                 lambda_k * (1 - pi_k) * b_k,
                 m_k * mu_k,
-                np.isclose(lambda_k * (1 - pi_k) * b_k, m_k * mu_k),
+                real_time_balance_k,
             )
+
         # retry flow
-        y_r = metrics.mean_retry_requests
-        y_q = metrics.mean_freeze_requests
-        Lambda_b = metrics.intensity_blocked_requests
-        H = self.params.leave_probability
+        y_r = metrics.y_r
+        y_q = metrics.y_q
+        Lambda_e_b = metrics.Lambda_e_b
+        H = self.params.retry_probability
         sigma = self.params.queue_intensity
         nu = self.params.retry_intensity
 
+        retry_balance = np.isclose(y_r * nu, Lambda_e_b * H + y_q * sigma * H)
         logger.info(
             "Retry flow balance (%2.5f, %2.5f): %s",
             y_r * nu,
-            Lambda_b * H + y_q * sigma * H,
-            np.isclose(y_r * nu, Lambda_b * H + y_q * sigma * H),
+            Lambda_e_b * H + y_q * sigma * H,
+            retry_balance,
         )
 
         # elastic data flow
-        Lambda = metrics.intensity_all_requests
+        Lambda_e = metrics.Lambda_e
         mu_e = self.params.data_mu
         m_e = metrics.mean_resources_per_data_flow
+        elastic_balance_1 = np.isclose(Lambda_e, Lambda_e_b + y_q * sigma + m_e * mu_e)
         logger.info(
             "Elastic flow balance (%2.5f, %2.5f): %s",
-            Lambda,
-            Lambda_b + y_q * sigma + m_e * mu_e,
-            np.isclose(Lambda, Lambda_b + y_q * sigma + m_e * mu_e),
+            Lambda_e,
+            Lambda_e_b + y_q * sigma + m_e * mu_e,
+            elastic_balance_1,
         )
 
         # elastic data flow
-        L_e = (1 - H) * (metrics.intensity_blocked_requests + y_q * sigma)
-        mu_e = self.params.data_mu
-        m_e = metrics.mean_resources_per_data_flow
+        L_e = (1 - H) * (Lambda_e_b + y_q * sigma)
         lambda_e = self.params.data_lambda
+        elastic_balance_2 = np.isclose(lambda_e, L_e + m_e * mu_e)
         logger.info(
             "Primary elastic flow balance (%2.5f, %2.5f): %s",
             lambda_e,
             L_e + m_e * mu_e,
-            np.isclose(lambda_e, L_e + m_e * mu_e),
+            elastic_balance_2,
         )
+
+        return all(real_time_balances) and retry_balance and elastic_balance_1 and elastic_balance_2
 
 
 @njit(cache=True)
@@ -498,23 +533,22 @@ def main():
 
     params = ParametersSet(
         real_time_flows=2,
-        real_time_lambdas=[2, 4],
-        real_time_mus=[4, 2],
-        real_time_resources=[8, 4],
-        data_resources_min=4,
-        data_resources_max=100,
-        data_lambda=20,
+        real_time_lambdas=[4, 2],
+        real_time_mus=[1, 1],
+        real_time_resources=[4, 8],
+        data_resources_min=2,
+        data_lambda=10,
         data_mu=1,
-        beam_capacity=50,
         queue_intensity=1,
         retry_intensity=1,
-        leave_probability=0.8,
+        retry_probability=0.8,
+        beam_capacity=80,
     )
 
-    solver = Solver(params, 1e-7, 2000)
-    print(len(solver.state_list))
-    it, error = solver.solve()
-    logger.info("Final: it=%d, error=%2.10f", it, error)
+    logger.info("%s", params)
+    solver = Solver(params, 1e-7, 7500)
+    is_valid = solver.solve_with_r_max(r_min=20, step=10, max_attempts=10)
+    logger.info("Solution is valid: %s", is_valid)
 
 
 if __name__ == "__main__":
