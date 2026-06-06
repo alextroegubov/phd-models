@@ -73,18 +73,6 @@ class Solver:
 
         logger.info("Init solver: r_max=%d, number of states: %d", r_max, len(self.state_list))
 
-    @property
-    def batch_probs(self) -> np.ndarray:
-        """Return validated probabilities f_s for ET batch sizes s = 1, ..., B."""
-        probs = np.asarray(getattr(self.params, "data_batch_probs", [1.0]), dtype=np.float64)
-        if probs.ndim != 1 or probs.size == 0:
-            raise ValueError("data_batch_probs must be a non-empty one-dimensional list")
-        if np.any(probs < 0):
-            raise ValueError("data_batch_probs must contain non-negative probabilities")
-        if not np.isclose(probs.sum(), 1.0):
-            raise ValueError(f"data_batch_probs must sum to 1.0, got {probs.sum()}")
-        return probs
-
     def precompute_state_indices(self):
         """Precompute state indices for faster access during the iterations"""
 
@@ -94,11 +82,7 @@ class Solver:
 
         self.idx_d_plus_1 = np.array([index_of(state.d_(1)) for state in self.state_list], dtype=np.int32)
 
-        self.idx_d_minus_1 = np.array([index_of(state.d_(-1)) for state in self.state_list], dtype=np.int32)
-
         self.idx_r_plus_1 = np.array([index_of(state.r_(1)) for state in self.state_list], dtype=np.int32)
-
-        self.idx_r_minus_1 = np.array([index_of(state.r_(-1)) for state in self.state_list], dtype=np.int32)
 
         self.idx_d_plus_1_r_minus_1 = np.array(
             [index_of(state.dr_(d_d=1, d_r=-1)) for state in self.state_list], dtype=np.int32
@@ -133,15 +117,14 @@ class Solver:
         nu = self.params.retry_intensity
         H = self.params.retry_probability
 
-        batch_sizes = np.arange(1, len(self.batch_probs) + 1, dtype=np.float64)
-        at_least_one_retry_prob = float(np.sum([f_s * (1 - (1 - H)**s) for f_s, s in zip(self.batch_probs, batch_sizes)]))
+        batch_probs = self.params.data_batch_probs
+        batch_sizes = np.arange(1, len(batch_probs) + 1, dtype=np.float64)
+        at_least_one_retry_prob = float(np.sum([f_s * (1 - (1 - H) ** s) for f_s, s in zip(batch_probs, batch_sizes)]))
 
         self.denominator = np.zeros(len(self.state_list), dtype=np.float64)
 
-        rt_resources = np.array(self.params.real_time_resources)
-
         self.l_arr = np.array(
-            [np.dot(state.i_vec, rt_resources) for state in self.state_list],
+            [np.dot(state.i_vec, b) for state in self.state_list],
             dtype=np.float64,
         )
         self.q_arr = np.array(
@@ -188,16 +171,7 @@ class Solver:
             )
 
     def precompute_numerator_coefs(self):
-        """Precompute numerator coefs for SEE for each state.
-
-        Primary ET arrivals are batch arrivals. For them, incoming transitions are
-        precomputed as flattened arrays:
-
-            target idx -> source indices + transition coefficients
-
-        This keeps the numba iteration simple and avoids Python-level loops during
-        the Gauss-Seidel procedure.
-        """
+        """Precompute numerator coefs for SEE for each state."""
 
         n_flows = self.params.real_time_flows
         lamb = np.array(self.params.real_time_lambdas)
@@ -207,7 +181,8 @@ class Solver:
         lambda_e = self.params.data_lambda
         mu_e = self.params.data_mu
         b_min = self.params.data_resources_min
-        batch_probs = self.batch_probs
+        batch_probs = self.params.data_batch_probs
+        batch_sizes = list(range(1, len(batch_probs) + 1))
 
         v = self.params.beam_capacity
         sigma = self.params.queue_intensity
@@ -234,41 +209,28 @@ class Solver:
             q_prime = self.q_prime_arr[idx]
 
             # Incoming transitions caused by primary ET batch arrivals.
-            # Source state: (i_vec, d0, r - m)
-            # Target state: (i_vec, d, r)
+            # from state (i_vec, d0, r - m) to state (i_vec, d, r)
             #
+            # a(d0) = maximum number of ET to accept
             # j(d0, s) = number of accepted ET requests from a batch of size s
             # z(d0, s) = number of rejected ET requests from that batch
-            # m          = number of rejected ET requests that enter the retry orbit
+            # m <= z(d0, s) = number of retried ET requests
             for d0 in range(d + 1):
-                accept_capacity = max(0, c - d0)
-                for s_idx, f_s in enumerate(batch_probs):
-                    s = s_idx + 1
-                    accepted = min(s, accept_capacity)
+                for s, f_s in zip(batch_sizes, batch_probs):
+                    accepted = min(s, max(0, c - d0))
                     rejected = s - accepted
 
                     if d != d0 + accepted:
                         continue
 
-                    max_m = min(rejected, r)
-                    for m in range(max_m + 1):
+                    for m in range(min(rejected, r) + 1):
                         # Exclude self-transition: no accepted requests and no new retries.
                         if accepted == 0 and m == 0:
                             continue
 
                         src_idx = self.state_to_idx.get(State(i_vec, d0, r - m), -1)
-                        if src_idx < 0:
-                            print("here!")
-                            continue
-
-                        coef = (
-                            lambda_e
-                            * f_s
-                            * comb(rejected, m)
-                            * (H**m)
-                            * ((1 - H) ** (rejected - m))
-                        )
-                        if coef > 0:
+                        coef = lambda_e * f_s * comb(rejected, m) * (H**m) * ((1 - H) ** (rejected - m))
+                        if coef > 0 and src_idx >= 0:
                             batch_src_indices.append(src_idx)
                             batch_coefs.append(float(coef))
 
@@ -352,9 +314,7 @@ class Solver:
             self.denominator,
             self.idx_rt_minus,
             self.idx_rt_plus,
-            self.idx_d_minus_1,
             self.idx_d_plus_1,
-            self.idx_r_minus_1,
             self.idx_r_plus_1,
             self.idx_d_plus_1_r_minus_1,
             self.idx_d_minus_1_r_plus_1,
@@ -513,9 +473,7 @@ def solve_numba(
     denominator,
     idx_rt_minus,
     idx_rt_plus,
-    idx_d_minus_1,
     idx_d_plus_1,
-    idx_r_minus_1,
     idx_r_plus_1,
     idx_d_plus_1_r_minus_1,
     idx_d_minus_1_r_plus_1,
@@ -607,12 +565,14 @@ def main():
         real_time_mus=[1, 1],
         real_time_resources=[4, 8],
         data_resources_min=2,
+        data_resources_max=100,
         data_lambda=10,
         data_mu=1,
         queue_intensity=1,
         retry_intensity=1,
         retry_probability=0.8,
         beam_capacity=80,
+        data_batch_probs=[0.2, 0.2, 0.1, 0.1, 0.2, 0.2],
     )
 
     logger.info("%s", params)

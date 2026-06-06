@@ -1,37 +1,71 @@
 from dataclasses import dataclass, field
+from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
+import numpy as np
 
 
-@dataclass
-class ParametersSet:
+class ParametersSet(BaseModel):
+
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
     # n
-    real_time_flows: int
+    real_time_flows: int = Field(ge=0, description="Number of real-time flows")
     # lambda_1, lambda_2, ..., lambda_n
-    real_time_lambdas: list[float]
+    real_time_lambdas: list[float] = Field(description="Real-time flow arrival rates")
     # mu_1, mu_2, ..., mu_n
-    real_time_mus: list[float]
+    real_time_mus: list[float] = Field(description="Real-time flow service rates")
     # b_1, b_2, ..., b_n
-    real_time_resources: list[int]
+    real_time_resources: list[int] = Field(description="Real-time flow resource units")
 
     # b_min
-    data_resources_min: int
+    data_resources_min: int = Field(ge=1, description="Minimum data resource units")
+    # b_max
+    data_resources_max: int = Field(ge=1, description="Maximum data resource units")
     # lambda_e
-    data_lambda: float
+    data_lambda: float = Field(ge=0, description="Data batch arrival rate")
     # mu_e
-    data_mu: float
+    data_mu: float = Field(ge=0, description="Data service rate")
 
     # sigma
-    queue_intensity: float
+    queue_intensity: float = Field(ge=0, description="Queue intensity")
     # nu
-    retry_intensity: float
+    retry_intensity: float = Field(ge=0, description="Retry intensity")
     # H
-    retry_probability: float
+    retry_probability: float = Field(ge=0, le=1, description="Retry probability")
 
     # v
-    beam_capacity: int
+    beam_capacity: int = Field(ge=1, description="Beam capacity")
 
-    # f_s, s = 1, ..., B. By default B=1 and f_1=1, i.e. ordinary single arrivals.
-    data_batch_probs: list[float] = field(default_factory=lambda: [1.0])
-    random_seed: int = 0
+    # f_s, s = 1, ..., B
+    data_batch_probs: list[float] = Field(description="Data batch probabilities")
+
+    random_seed: int = Field(default=0, description="Random seed")
+
+    @field_validator("data_batch_probs", mode="before")
+    def validate_data_batch_probs(cls, v):
+        if len(v) == 0:
+            raise ValueError("Empty data_batch_probs")
+        if not np.isclose(np.sum(v), 1.0):
+            raise ValueError("Batch probabilities must sum to 1.0")
+        if np.any(np.array(v) < 0):
+            raise ValueError("Some batch probabilities are negative")
+        return v
+
+    @model_validator(mode="after")
+    def validate_rt_params(self):
+        if len(self.real_time_lambdas) != self.real_time_flows:
+            raise ValueError("Number of RT lambdas != number of RT flows")
+        if np.any(np.array(self.real_time_lambdas) < 0):
+            raise ValueError("Some RT lambdas are negative")
+        if len(self.real_time_mus) != self.real_time_flows:
+            raise ValueError("Number of RT mus != number of RT flows")
+        if np.any(np.array(self.real_time_mus) < 0):
+            raise ValueError("Some RT mus are negative")
+        if len(self.real_time_resources) != self.real_time_flows:
+            raise ValueError("Number of RT resources != number of RT flows")
+        if np.any(np.array(self.real_time_resources) < 0):
+            raise ValueError("Some RT resources are negative")
+        return self
 
     def __str__(self) -> str:
         def f_lst_4f(lst):
@@ -171,7 +205,6 @@ class Metrics:
     @property
     def util(self) -> float:
         return self.beam_utilization
-
 
     def __str__(self):
         def f_lst_5f(lst):
