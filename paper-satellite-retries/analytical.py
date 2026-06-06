@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import itertools
 import time
+from math import comb
 from dataclasses import dataclass
 import numpy as np
 from utils import ParametersSet, Metrics
@@ -12,7 +13,7 @@ from numba import njit
 from typing import ClassVar
 
 logger = logging.getLogger(__name__)
-# logging.basicConfig(filename="analytical.log", filemode="w", level=logging.INFO, encoding="utf-8")
+logging.basicConfig(filename="analytical.log", filemode="w", level=logging.INFO, encoding="utf-8")
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +73,18 @@ class Solver:
 
         logger.info("Init solver: r_max=%d, number of states: %d", r_max, len(self.state_list))
 
+    @property
+    def batch_probs(self) -> np.ndarray:
+        """Return validated probabilities f_s for ET batch sizes s = 1, ..., B."""
+        probs = np.asarray(getattr(self.params, "data_batch_probs", [1.0]), dtype=np.float64)
+        if probs.ndim != 1 or probs.size == 0:
+            raise ValueError("data_batch_probs must be a non-empty one-dimensional list")
+        if np.any(probs < 0):
+            raise ValueError("data_batch_probs must contain non-negative probabilities")
+        if not np.isclose(probs.sum(), 1.0):
+            raise ValueError(f"data_batch_probs must sum to 1.0, got {probs.sum()}")
+        return probs
+
     def precompute_state_indices(self):
         """Precompute state indices for faster access during the iterations"""
 
@@ -120,6 +133,9 @@ class Solver:
         nu = self.params.retry_intensity
         H = self.params.retry_probability
 
+        batch_sizes = np.arange(1, len(self.batch_probs) + 1, dtype=np.float64)
+        at_least_one_retry_prob = float(np.sum([f_s * (1 - (1 - H)**s) for f_s, s in zip(self.batch_probs, batch_sizes)]))
+
         self.denominator = np.zeros(len(self.state_list), dtype=np.float64)
 
         rt_resources = np.array(self.params.real_time_resources)
@@ -145,10 +161,10 @@ class Solver:
             # serve RT request
             real_time_serv_d = sum(i_vec[k] * mu[k] * (i_vec[k] > 0) for k in range(n_flows))
 
-            # accept ET request
+            # accept at least one ET request
             data_arr_accept_d = lambda_e * (l + d * b_min + b_min <= v)
-            # reject ET request and it is retried
-            data_arr_reject_d = lambda_e * H * (l + d * b_min + b_min > v)
+            # accept no ET requests and at least one is retried
+            data_arr_reject_d = lambda_e * at_least_one_retry_prob * (l + d * b_min + b_min > v)
 
             # serve ET request
             data_serv_d = mu_e * (v - l) * (d - q > 0)
@@ -172,7 +188,16 @@ class Solver:
             )
 
     def precompute_numerator_coefs(self):
-        """Precompute numerator coefs for SEE for each state"""
+        """Precompute numerator coefs for SEE for each state.
+
+        Primary ET arrivals are batch arrivals. For them, incoming transitions are
+        precomputed as flattened arrays:
+
+            target idx -> source indices + transition coefficients
+
+        This keeps the numba iteration simple and avoids Python-level loops during
+        the Gauss-Seidel procedure.
+        """
 
         n_flows = self.params.real_time_flows
         lamb = np.array(self.params.real_time_lambdas)
@@ -182,14 +207,13 @@ class Solver:
         lambda_e = self.params.data_lambda
         mu_e = self.params.data_mu
         b_min = self.params.data_resources_min
+        batch_probs = self.batch_probs
 
         v = self.params.beam_capacity
         sigma = self.params.queue_intensity
         nu = self.params.retry_intensity
         H = self.params.retry_probability
 
-        self.data_arr_accept_n_coef = np.zeros(len(self.state_list), dtype=np.float64)
-        self.data_arr_reject_n_coef = np.zeros(len(self.state_list), dtype=np.float64)
         self.data_serv_n_coef = np.zeros(len(self.state_list), dtype=np.float64)
         self.freeze_n_coef = np.zeros(len(self.state_list), dtype=np.float64)
         self.freeze_out_n_coef = np.zeros(len(self.state_list), dtype=np.float64)
@@ -198,14 +222,57 @@ class Solver:
         self.real_time_arr_n_coefs = np.zeros((len(self.state_list), n_flows), dtype=np.float64)
         self.real_time_serv_n_coefs = np.zeros((len(self.state_list), n_flows), dtype=np.float64)
 
+        batch_src_indices: list[int] = []
+        batch_coefs: list[float] = []
+        batch_offsets = np.zeros(len(self.state_list) + 1, dtype=np.int32)
+
         for idx, state in enumerate(self.state_list):
             i_vec, d, r = state.i_vec, state.d, state.r
 
             l = self.l_arr[idx]
+            c = int((v - l) // b_min)
             q_prime = self.q_prime_arr[idx]
 
-            self.data_arr_accept_n_coef[idx] = lambda_e * (l + (d - 1) * b_min + b_min <= v and d > 0)
-            self.data_arr_reject_n_coef[idx] = lambda_e * H * (r > 0 and l + d * b_min + b_min > v)
+            # Incoming transitions caused by primary ET batch arrivals.
+            # Source state: (i_vec, d0, r - m)
+            # Target state: (i_vec, d, r)
+            #
+            # j(d0, s) = number of accepted ET requests from a batch of size s
+            # z(d0, s) = number of rejected ET requests from that batch
+            # m          = number of rejected ET requests that enter the retry orbit
+            for d0 in range(d + 1):
+                accept_capacity = max(0, c - d0)
+                for s_idx, f_s in enumerate(batch_probs):
+                    s = s_idx + 1
+                    accepted = min(s, accept_capacity)
+                    rejected = s - accepted
+
+                    if d != d0 + accepted:
+                        continue
+
+                    max_m = min(rejected, r)
+                    for m in range(max_m + 1):
+                        # Exclude self-transition: no accepted requests and no new retries.
+                        if accepted == 0 and m == 0:
+                            continue
+
+                        src_idx = self.state_to_idx.get(State(i_vec, d0, r - m), -1)
+                        if src_idx < 0:
+                            print("here!")
+                            continue
+
+                        coef = (
+                            lambda_e
+                            * f_s
+                            * comb(rejected, m)
+                            * (H**m)
+                            * ((1 - H) ** (rejected - m))
+                        )
+                        if coef > 0:
+                            batch_src_indices.append(src_idx)
+                            batch_coefs.append(float(coef))
+
+            batch_offsets[idx + 1] = len(batch_src_indices)
 
             self.data_serv_n_coef[idx] = mu_e * (v - l) * (d + 1 - q_prime > 0)
 
@@ -221,6 +288,10 @@ class Solver:
             self.real_time_serv_n_coefs[idx] = np.array(
                 [(i_vec[k] + 1) * mu[k] * (l + b[k] <= v) for k in range(n_flows)], dtype=np.float64
             )
+
+        self.batch_arr_n_offsets = batch_offsets
+        self.batch_arr_n_src_indices = np.array(batch_src_indices, dtype=np.int32)
+        self.batch_arr_n_coefs = np.array(batch_coefs, dtype=np.float64)
 
     def get_possible_states(self) -> list[State]:
         """Get possible states for markov process."""
@@ -289,8 +360,9 @@ class Solver:
             self.idx_d_minus_1_r_plus_1,
             self.real_time_arr_n_coefs,
             self.real_time_serv_n_coefs,
-            self.data_arr_accept_n_coef,
-            self.data_arr_reject_n_coef,
+            self.batch_arr_n_offsets,
+            self.batch_arr_n_src_indices,
+            self.batch_arr_n_coefs,
             self.data_serv_n_coef,
             self.freeze_n_coef,
             self.freeze_out_n_coef,
@@ -449,8 +521,9 @@ def solve_numba(
     idx_d_minus_1_r_plus_1,
     real_time_arr_n_coefs,
     real_time_serv_n_coefs,
-    data_arr_accept_n_coef,
-    data_arr_reject_n_coef,
+    batch_arr_n_offsets,
+    batch_arr_n_src_indices,
+    batch_arr_n_coefs,
     data_serv_n_coef,
     freeze_n_coef,
     freeze_out_n_coef,
@@ -461,7 +534,7 @@ def solve_numba(
     iteration = 0
     error = 1e10
 
-    while error > max_eps and iteration < max_iter:
+    while (error > max_eps or iteration < 10) and iteration < max_iter:
         iteration += 1
         n_states = p.shape[0]
         n_flows = idx_rt_minus.shape[1]
@@ -482,15 +555,12 @@ def solve_numba(
                 if j >= 0:
                     num += p[j] * real_time_serv_n_coefs[idx, k]
 
-            # ET accept
-            j = idx_d_minus_1[idx]
-            if j >= 0:
-                num += p[j] * data_arr_accept_n_coef[idx]
-
-            # ET reject -> retry
-            j = idx_r_minus_1[idx]
-            if j >= 0:
-                num += p[j] * data_arr_reject_n_coef[idx]
+            # Primary ET batch arrivals.
+            # Incoming transitions are precomputed because one batch can change
+            # both d and r: (d0, r - m) -> (d, r).
+            for t in range(batch_arr_n_offsets[idx], batch_arr_n_offsets[idx + 1]):
+                j = batch_arr_n_src_indices[t]
+                num += p[j] * batch_arr_n_coefs[t]
 
             # ET service
             j = idx_d_plus_1[idx]

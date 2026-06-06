@@ -28,6 +28,9 @@ class ParametersSet:
 
     # v
     beam_capacity: int
+
+    # f_s, s = 1, ..., B. By default B=1 and f_1=1, i.e. ordinary single arrivals.
+    data_batch_probs: list[float] = field(default_factory=lambda: [1.0])
     random_seed: int = 0
 
     def __str__(self) -> str:
@@ -52,6 +55,7 @@ class ParametersSet:
             f"    σ = {self.queue_intensity:.5f}\n"
             f"    ν = {self.retry_intensity:.5f}\n"
             f"    H = {self.retry_probability:.5f}\n"
+            f"    f_s = [{f_lst_4f(self.data_batch_probs)}]\n"
         )
 
 
