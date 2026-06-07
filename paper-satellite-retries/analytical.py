@@ -197,6 +197,12 @@ class Solver:
         self.real_time_arr_n_coefs = np.zeros((len(self.state_list), n_flows), dtype=np.float64)
         self.real_time_serv_n_coefs = np.zeros((len(self.state_list), n_flows), dtype=np.float64)
 
+        # For each target state, we have a sum of multiple [source_state_prob * coef] terms.
+        # The number of terms is variable and depends on the target state, so we need to store the offsets.
+        # batch_offsets[idx + 1] - batch_offsets[idx] is the number of terms for the target state at index idx.
+        # batch_src_indices and batch_coefs are the source states and coefficients for the terms.
+        # For the state self.state_list[idx], the slice is [batch_offsets[idx], ..., batch_offsets[idx + 1] - 1]
+
         batch_src_indices: list[int] = []
         batch_coefs: list[float] = []
         batch_offsets = np.zeros(len(self.state_list) + 1, dtype=np.int32)
@@ -282,11 +288,23 @@ class Solver:
         """Solve the model with different r_max values."""
         is_valid = False
         attempt = 0
+
+        self.init_state_list(r_max=r_min + attempt * step)
+
         while not is_valid and attempt < max_attempts:
             logger.info("--------------------------------")
             logger.info("Attempt %d", attempt)
-            self.init_state_list(r_min + attempt * step)
-            logger.info("\tNumber of states: %d", len(self.state_list))
+
+            if attempt > 0:
+                logger.info("Using previous probabilities as initial guess")
+                # save previous iterations probabilities
+                old_state_to_prob = dict(zip(self.state_list, self.p))
+                # new state list with new r_max
+                self.init_state_list(r_min + attempt * step)
+                # update known probabilities
+                self.p = np.array([old_state_to_prob.get(state, 1e-20) for state in self.state_list], dtype=np.float64)
+                self.p /= self.p.sum()
+
             it, error = self.solve()
             logger.info("\tFinal: it=%d, error=%2.10f", it, error)
 
@@ -340,6 +358,15 @@ class Solver:
 
         return iteration, error
 
+    def retry_boundary_mass(self) -> float:
+        batch_size_max = len(self.params.data_batch_probs)
+        r_arr = np.array([state.r for state in self.state_list], dtype=np.int32)
+
+        # State.r_max currently means r = 0, ..., State.r_max - 1
+        boundary_start = max(0, State.r_max - batch_size_max)
+
+        return float(np.sum(self.p * (r_arr >= boundary_start)))
+
     def calculate_metrics(self) -> Metrics:
         """Calculate metrics for the model."""
 
@@ -352,6 +379,8 @@ class Solver:
         b_min = self.params.data_resources_min
         H = self.params.retry_probability
         mu_e = self.params.data_mu
+        batch_probs = self.params.data_batch_probs
+        batch_sizes = np.arange(1, len(batch_probs) + 1, dtype=np.float64)
 
         d_arr = np.array([state.d for state in self.state_list], dtype=np.int32)
         r_arr = np.array([state.r for state in self.state_list], dtype=np.int32)
@@ -366,20 +395,49 @@ class Solver:
         y_q = np.sum(self.p * self.q_arr)
         y_d = np.sum(self.p * d_arr)
 
-        y_e = np.sum(self.p * (d_arr - self.q_arr) * (d_arr - self.q_arr > 0))
+        y_e = np.sum(self.p * (d_arr - self.q_arr))
         m_e = np.sum(self.p * (v - self.l_arr) * (d_arr - self.q_arr > 0))
         b_e = m_e / y_e
 
-        Lambda_e_b = np.sum(self.p * (lambda_e + r_arr * nu) * (self.l_arr + d_arr * b_min + b_min > v))
-        Lambda_e = lambda_e + y_r * nu
+        mean_batch_size = float(np.sum(batch_probs * batch_sizes))
+        c_arr = (v - self.l_arr) // b_min
+        F_l_d_arr = np.array(
+            [
+                np.sum(
+                    [
+                        f_s * (s * (d_arr >= c_arr) + np.maximum(0, s + d_arr - c_arr) * (d_arr < c_arr))
+                        for f_s, s in zip(batch_probs, batch_sizes)
+                    ],
+                    axis=0,
+                )
+            ],
+        )
+        # primary intensity
+        Lambda_e_p = lambda_e * mean_batch_size
+        # primary blocked intensity
+        Lambda_e_p_b = float(np.sum(self.p * lambda_e * F_l_d_arr))
 
-        pi_e_0 = np.sum(self.p * (self.l_arr + (d_arr + 1) * b_min > v))
+        # retry intensity
+        Lambda_e_r = y_r * nu
+        # retry blocked intensity
+        Lambda_e_r_b = float(np.sum(self.p * r_arr * nu * (self.l_arr + (d_arr + 1) * b_min > v)))
+
+        # total_data_intensity
+        Lambda_e = Lambda_e_r + Lambda_e_p
+        # total blocked data intensity
+        Lambda_e_b = Lambda_e_p_b + Lambda_e_r_b
+
+        pi_e_0 = Lambda_e_p_b / Lambda_e_p
         pi_e_a = Lambda_e_b / Lambda_e
-        pi_e_r = (1 - H) * (Lambda_e_b + y_q * sigma) / lambda_e
-        W_sess = np.sum(self.p * d_arr) / (m_e * mu_e + y_q * sigma)
-        A = Lambda_e / lambda_e
+        pi_e_r = (1.0 - H) * (Lambda_e_b + y_q * sigma) / Lambda_e_p
+
+        W_sess = y_d / (m_e * mu_e + y_q * sigma)
+
+        A = Lambda_e / Lambda_e_p
 
         util = sum(m_k) + m_e
+
+        logger.info("\tRetry boundary mass: %.12f", self.retry_boundary_mass())
 
         return Metrics(
             rt_request_rej_prob=[float(x) for x in pi_k],
@@ -391,78 +449,89 @@ class Solver:
             mean_data_requests_in_service=float(y_e),
             mean_resources_per_data_flow=float(m_e),
             mean_resources_per_data_request=float(b_e),
-            intensity_all_requests=float(Lambda_e),
-            intensity_blocked_requests=float(Lambda_e_b),
-            primary_data_request_reject_prob=float(pi_e_0),
-            data_request_attempt_reject_prob=float(pi_e_a),
-            data_request_not_serviced_prob=float(pi_e_r),
+            primary_intensity=float(Lambda_e_p),
+            primary_blocked_intensity=float(Lambda_e_p_b),
+            retry_intensity=float(Lambda_e_r),
+            retry_blocked_intensity=float(Lambda_e_r_b),
+            total_blocked_data_intensity=float(Lambda_e_b),
+            primary_request_reject_prob=float(pi_e_0),
+            attempt_request_reject_prob=float(pi_e_a),
+            not_serviced_request_prob=float(pi_e_r),
             mean_data_request_in_system_time=float(W_sess),
             retry_amplification_factor=float(A),
             beam_utilization=float(util),
         )
 
+    @staticmethod
+    def check_balance(name: str, lhs: float, rhs: float, rtol: float = 5e-4, atol: float = 1e-8) -> bool:
+        abs_err = abs(lhs - rhs)
+        rel_err = abs_err / max(abs(lhs), abs(rhs), 1.0)
+        ok = bool(np.isclose(lhs, rhs, rtol=rtol, atol=atol))
+
+        logger.info(
+            "%s balance lhs=%.5f rhs=%.5f abs_err=%.10e rel_err=%.10e ok=%s",
+            name,
+            lhs,
+            rhs,
+            abs_err,
+            rel_err,
+            ok,
+        )
+        return ok
+
     def check_solution(self, metrics: Metrics):
-        """Check the solution."""
+        """Check conservation laws for the stationary distribution."""
 
-        # real-time traffic flows
-        real_time_balances = []
-        for k in range(self.params.real_time_flows):
-            lambda_k = self.params.real_time_lambdas[k]
-            mu_k = self.params.real_time_mus[k]
-            b_k = self.params.real_time_resources[k]
-
-            pi_k = metrics.pi_k[k]
-            m_k = metrics.m_k[k]
-            real_time_balance_k = np.isclose(lambda_k * (1 - pi_k) * b_k, m_k * mu_k)
-            real_time_balances.append(real_time_balance_k)
-            logger.info(
-                "Real-time flow %d balance (%2.5f, %2.5f): %s",
-                k,
-                lambda_k * (1 - pi_k) * b_k,
-                m_k * mu_k,
-                real_time_balance_k,
-            )
-
-        # retry flow
-        y_r = metrics.y_r
-        y_q = metrics.y_q
-        Lambda_e_b = metrics.Lambda_e_b
-        H = self.params.retry_probability
-        sigma = self.params.queue_intensity
-        nu = self.params.retry_intensity
-
-        retry_balance = np.isclose(y_r * nu, Lambda_e_b * H + y_q * sigma * H)
-        logger.info(
-            "Retry flow balance (%2.5f, %2.5f): %s",
-            y_r * nu,
-            Lambda_e_b * H + y_q * sigma * H,
-            retry_balance,
-        )
-
-        # elastic data flow
-        Lambda_e = metrics.Lambda_e
         mu_e = self.params.data_mu
-        m_e = metrics.mean_resources_per_data_flow
-        elastic_balance_1 = np.isclose(Lambda_e, Lambda_e_b + y_q * sigma + m_e * mu_e)
-        logger.info(
-            "Elastic flow balance (%2.5f, %2.5f): %s",
-            Lambda_e,
-            Lambda_e_b + y_q * sigma + m_e * mu_e,
-            elastic_balance_1,
+        sigma = self.params.queue_intensity
+        H = self.params.retry_probability
+
+        y_q = metrics.y_q
+        m_e = metrics.m_e
+
+        Lambda_e_r = metrics.Lambda_e_r
+        Lambda_e_b = metrics.Lambda_e_b
+        Lambda_e = metrics.Lambda_e
+        Lambda_e_p = metrics.Lambda_e_p
+
+        # Real-time flow balances:
+        # lambda_k * (1 - pi_k) * b_k = m_k * mu_k
+        real_time_balances = [
+            self.check_balance(
+                name=f"Real-time flow {k}",
+                lhs=lambda_k * (1.0 - metrics.pi_k[k]) * b_k,
+                rhs=metrics.m_k[k] * mu_k,
+            )
+            for k, (lambda_k, mu_k, b_k) in enumerate(
+                zip(self.params.real_time_lambdas, self.params.real_time_mus, self.params.real_time_resources)
+            )
+        ]
+
+        # Retry orbit balance:
+        # Lambda_e_r = H * (Lambda_e_b + y_q * sigma)
+        retry_balance = self.check_balance(
+            name="Retry flow",
+            lhs=Lambda_e_r,
+            rhs=H * (Lambda_e_b + y_q * sigma),
         )
 
-        # elastic data flow
-        L_e = (1 - H) * (Lambda_e_b + y_q * sigma)
-        lambda_e = self.params.data_lambda
-        elastic_balance_2 = np.isclose(lambda_e, L_e + m_e * mu_e)
-        logger.info(
-            "Primary elastic flow balance (%2.5f, %2.5f): %s",
-            lambda_e,
-            L_e + m_e * mu_e,
-            elastic_balance_2,
+        # Total elastic flow balance:
+        # Lambda_e = Lambda_e_b + y_q * sigma + m_e * mu_e
+        elastic_balance = self.check_balance(
+            name="Elastic flow",
+            lhs=Lambda_e,
+            rhs=Lambda_e_b + y_q * sigma + m_e * mu_e,
         )
 
-        return all(real_time_balances) and retry_balance and elastic_balance_1 and elastic_balance_2
+        # Primary elastic flow balance:
+        # Lambda_e_p = m_e * mu_e + (1 - H) * (Lambda_e_b + y_q * sigma)
+        primary_elastic_balance = self.check_balance(
+            name="Primary elastic flow",
+            lhs=Lambda_e_p,
+            rhs=m_e * mu_e + (1.0 - H) * (Lambda_e_b + y_q * sigma),
+        )
+
+        return all(real_time_balances) and retry_balance and elastic_balance and primary_elastic_balance
 
 
 @njit(cache=True)
@@ -576,8 +645,8 @@ def main():
     )
 
     logger.info("%s", params)
-    solver = Solver(params, 1e-7, 7500)
-    is_valid = solver.solve_with_r_max(r_min=20, step=10, max_attempts=10)
+    solver = Solver(params, 1e-9, 2500)
+    is_valid = solver.solve_with_r_max(r_min=90, step=10, max_attempts=10)
     logger.info("Solution is valid: %s", is_valid)
 
 

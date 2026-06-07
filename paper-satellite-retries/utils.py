@@ -93,8 +93,10 @@ class ParametersSet(BaseModel):
         )
 
 
-@dataclass
-class Metrics:
+class Metrics(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
     # pi_k, k=1,...,n
     rt_request_rej_prob: list[float] = field(default_factory=list)
     # y_k, k=1,...n
@@ -110,22 +112,28 @@ class Metrics:
     mean_data_requests_in_system: float = 0
     # y_e
     mean_data_requests_in_service: float = 0
-
     # m_e
     mean_resources_per_data_flow: float = 0
     # b_e
     mean_resources_per_data_request: float = 0
-    # Lambda_e
-    intensity_all_requests: float = 0
-    # Lambda_e,b
-    intensity_blocked_requests: float = 0
+
+    # Lambda_e_p
+    primary_intensity: float = 0
+    # Lambda_e_p^(b)
+    primary_blocked_intensity: float = 0
+    # Lambda_e_r
+    retry_intensity: float = 0
+    # Lambda_e_r^(b)
+    retry_blocked_intensity: float = 0
+    # Lambda_e^(b)
+    total_blocked_data_intensity: float = 0
 
     # pi_e,0
-    primary_data_request_reject_prob: float = 0
+    primary_request_reject_prob: float = 0
     # pi_e,a
-    data_request_attempt_reject_prob: float = 0
+    attempt_request_reject_prob: float = 0
     # pi_e,r
-    data_request_not_serviced_prob: float = 0
+    not_serviced_request_prob: float = 0
 
     # W_sess
     mean_data_request_in_system_time: float = 0
@@ -175,24 +183,40 @@ class Metrics:
         return self.mean_resources_per_data_request
 
     @property
+    def Lambda_e_p(self) -> float:
+        return self.primary_intensity
+
+    @property
+    def Lambda_e_p_b(self) -> float:
+        return self.primary_blocked_intensity
+
+    @property
+    def Lambda_e_r(self) -> float:
+        return self.retry_intensity
+
+    @property
+    def Lambda_e_r_b(self) -> float:
+        return self.retry_blocked_intensity
+
+    @property
     def Lambda_e(self) -> float:
-        return self.intensity_all_requests
+        return self.Lambda_e_p + self.Lambda_e_r
 
     @property
     def Lambda_e_b(self) -> float:
-        return self.intensity_blocked_requests
+        return self.Lambda_e_p_b + self.Lambda_e_r_b
 
     @property
     def pi_e_0(self) -> float:
-        return self.primary_data_request_reject_prob
+        return self.primary_request_reject_prob
 
     @property
     def pi_e_a(self) -> float:
-        return self.data_request_attempt_reject_prob
+        return self.attempt_request_reject_prob
 
     @property
     def pi_e_r(self) -> float:
-        return self.data_request_not_serviced_prob
+        return self.not_serviced_request_prob
 
     @property
     def W_sess(self) -> float:
@@ -222,17 +246,21 @@ class Metrics:
             f"      Mean requests in service    : [{f_lst_3f(self.mean_rt_requests_in_service)}]\n"
             f"      Mean resources per flow     : [{f_lst_3f(self.mean_resources_per_rt_flow)}]\n"
             f"  Elastic data flow:\n"
-            f"      Mean retry requests         : {self.mean_retry_requests:.4f}\n"
-            f"      Mean freeze requests        : {self.mean_freeze_requests:.4f}\n"
-            f"      Mean requests in system     : {self.mean_data_requests_in_system:.4f}\n"
-            f"      Mean requests in service    : {self.mean_data_requests_in_service:.4f}\n"
-            f"      Mean resources per flow     : {self.mean_resources_per_data_flow:.4f}\n"
-            f"      Mean resources per request  : {self.mean_resources_per_data_request:.4f}\n"
-            f"      Primary reject prob.        : {self.primary_data_request_reject_prob:.5f}\n"
-            f"      Attempt reject prob.        : {self.data_request_attempt_reject_prob:.5f}\n"
-            f"      Not serviced prob.          : {self.data_request_not_serviced_prob:.5f}\n"
-            f"      Mean time in system         : {self.mean_data_request_in_system_time:.4f}\n"
-            f"      Retry amplification factor   : {self.retry_amplification_factor:.4f}\n"
-            f"      Intensity of all requests    : {self.intensity_all_requests:.4f}\n"
-            f"      Intensity of blocked requests: {self.intensity_blocked_requests:.4f}\n"
+            f"      Mean retry requests         : {self.y_r:.4f}\n"
+            f"      Mean freeze requests        : {self.y_q:.4f}\n"
+            f"      Mean requests in system     : {self.y_d:.4f}\n"
+            f"      Mean requests in service    : {self.y_e:.4f}\n"
+            f"      Mean resources per flow     : {self.m_e:.4f}\n"
+            f"      Mean resources per request  : {self.b_e:.4f}\n"
+            f"      Primary reject prob.        : {self.pi_e_0:.5f}\n"
+            f"      Attempt reject prob.        : {self.pi_e_a:.5f}\n"
+            f"      Not serviced prob.          : {self.pi_e_r:.5f}\n"
+            f"      Mean time in system         : {self.W_sess:.4f}\n"
+            f"      Retry amplification factor  : {self.A:.4f}\n"
+            f"      Total data intensity        : {self.Lambda_e:.4f}\n"
+            f"      Total blocked data intensity: {self.Lambda_e_b:.4f}\n"
+            f"      Primary intensity           : {self.Lambda_e_p:.4f}\n"
+            f"      Primary blocked intensity   : {self.Lambda_e_p_b:.4f}\n"
+            f"      Retry intensity             : {self.Lambda_e_r:.4f}\n"
+            f"      Retry blocked intensity     : {self.Lambda_e_r_b:.4f}\n"
         )
