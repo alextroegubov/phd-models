@@ -116,11 +116,14 @@ class Solver:
         v = self.params.beam_capacity
         sigma = self.params.queue_intensity
         nu = self.params.retry_intensity
-        H = self.params.retry_probability
+        H_e = self.params.retry_primary_prob
+        H_r = self.params.retry_retry_prob
 
         batch_probs = self.params.data_batch_probs
-        batch_sizes = np.arange(1, len(batch_probs) + 1, dtype=np.float64)
-        at_least_one_retry_prob = float(np.sum([f_s * (1 - (1 - H) ** s) for f_s, s in zip(batch_probs, batch_sizes)]))
+        batch_sizes = np.arange(1, len(batch_probs) + 1, dtype=np.int32)
+        at_least_one_retry_prob = float(
+            np.sum([f_s * (1 - (1 - H_e) ** s) for f_s, s in zip(batch_probs, batch_sizes)])
+        )
 
         self.denominator = np.zeros(len(self.state_list), dtype=np.float64)
 
@@ -158,7 +161,7 @@ class Solver:
             # accept retry request
             retry_accept_d = r * nu * (l + d * b_min + b_min <= v)
             # reject retry request and it leaves the system
-            retry_reject_d = r * nu * (1 - H) * (l + d * b_min + b_min > v)
+            retry_reject_d = r * nu * (1 - H_r) * (l + d * b_min + b_min > v)
 
             self.denominator[idx] = (
                 real_time_arrival_d
@@ -189,7 +192,9 @@ class Solver:
         v = self.params.beam_capacity
         sigma = self.params.queue_intensity
         nu = self.params.retry_intensity
-        H = self.params.retry_probability
+        H_e = self.params.retry_primary_prob
+        H_r = self.params.retry_retry_prob
+        H_q = self.params.retry_freeze_prob
 
         self.data_serv_n_coef = np.zeros(len(self.state_list), dtype=np.float64)
         self.freeze_n_coef = np.zeros(len(self.state_list), dtype=np.float64)
@@ -237,7 +242,7 @@ class Solver:
                             continue
 
                         src_idx = self.state_to_idx.get(State(i_vec, d0, r - m), -1)
-                        coef = lambda_e * f_s * comb(rejected, m) * (H**m) * ((1 - H) ** (rejected - m))
+                        coef = lambda_e * f_s * comb(rejected, m) * (H_e**m) * ((1 - H_e) ** (rejected - m))
                         if coef > 0 and src_idx >= 0:
                             batch_src_indices.append(src_idx)
                             batch_coefs.append(float(coef))
@@ -246,11 +251,11 @@ class Solver:
 
             self.data_serv_n_coef[idx] = (mu_e / b_min) * min(v - l, (d + 1 - q_prime) * b_max)
 
-            self.freeze_n_coef[idx] = q_prime * sigma * H * (q_prime > 0 and r > 0)
-            self.freeze_out_n_coef[idx] = q_prime * sigma * (1 - H) * (q_prime > 0)
+            self.freeze_n_coef[idx] = q_prime * sigma * H_q * (q_prime > 0 and r > 0)
+            self.freeze_out_n_coef[idx] = q_prime * sigma * (1 - H_q) * (q_prime > 0)
 
             self.retry_accept_n_coef[idx] = (r + 1) * nu * (d > 0 and l + (d - 1) * b_min + b_min <= v)
-            self.retry_reject_n_coef[idx] = (r + 1) * nu * (1 - H) * (l + d * b_min + b_min > v)
+            self.retry_reject_n_coef[idx] = (r + 1) * nu * (1 - H_r) * (l + d * b_min + b_min > v)
 
             self.real_time_arr_n_coefs[idx] = np.array(
                 [lamb[k] * (i_vec[k] > 0) for k in range(n_flows)], dtype=np.float64
@@ -380,7 +385,9 @@ class Solver:
         sigma = self.params.queue_intensity
         b_min = self.params.data_resources_min
         b_max = self.params.data_resources_max
-        H = self.params.retry_probability
+        H_e = self.params.retry_primary_prob
+        H_r = self.params.retry_retry_prob
+        H_q = self.params.retry_freeze_prob
         mu_e = self.params.data_mu
         batch_probs = self.params.data_batch_probs
         batch_sizes = np.arange(1, len(batch_probs) + 1, dtype=np.float64)
@@ -432,7 +439,7 @@ class Solver:
 
         pi_e_0 = Lambda_e_p_b / Lambda_e_p
         pi_e_a = Lambda_e_b / Lambda_e
-        pi_e_r = (1.0 - H) * (Lambda_e_b + y_q * sigma) / Lambda_e_p
+        pi_e_r = ((1 - H_e) * Lambda_e_p_b + (1 - H_r) * Lambda_e_r_b + (1 - H_q) * y_q * sigma) / Lambda_e_p
 
         W_sess = y_d / (m_e * mu_e / b_min + y_q * sigma)
 
@@ -487,7 +494,9 @@ class Solver:
 
         mu_e = self.params.data_mu
         sigma = self.params.queue_intensity
-        H = self.params.retry_probability
+        H_e = self.params.retry_primary_prob
+        H_r = self.params.retry_retry_prob
+        H_q = self.params.retry_freeze_prob
         b_min = self.params.data_resources_min
 
         y_q = metrics.y_q
@@ -497,6 +506,8 @@ class Solver:
         Lambda_e_b = metrics.Lambda_e_b
         Lambda_e = metrics.Lambda_e
         Lambda_e_p = metrics.Lambda_e_p
+        Lambda_e_p_b = metrics.Lambda_e_p_b
+        Lambda_e_r_b = metrics.Lambda_e_r_b
 
         # Real-time flow balances:
         # lambda_k * (1 - pi_k) * b_k = m_k * mu_k
@@ -512,11 +523,11 @@ class Solver:
         ]
 
         # Retry orbit balance:
-        # Lambda_e_r = H * (Lambda_e_b + y_q * sigma)
+        # Lambda_e_r = H_e * Lambda_e_p_b + H_r * Lambda_e_r_b + H_q * y_q * sigma
         retry_balance = self.check_balance(
             name="Retry flow",
             lhs=Lambda_e_r,
-            rhs=H * (Lambda_e_b + y_q * sigma),
+            rhs=H_e * Lambda_e_p_b + H_r * Lambda_e_r_b + H_q * y_q * sigma,
         )
 
         # Total elastic flow balance:
@@ -528,11 +539,11 @@ class Solver:
         )
 
         # Primary elastic flow balance:
-        # Lambda_e_p = m_e * mu_e / b_min + (1 - H) * (Lambda_e_b + y_q * sigma)
+        # Lambda_e_p = m_e * mu_e / b_min + (1 - H_e) * Lambda_e_p_b + (1 - H_r) * Lambda_e_r_b + (1 - H_q) * y_q * sigma
         primary_elastic_balance = self.check_balance(
             name="Primary elastic flow",
             lhs=Lambda_e_p,
-            rhs=m_e * mu_e / b_min + (1.0 - H) * (Lambda_e_b + y_q * sigma),
+            rhs=m_e * mu_e / b_min + (1 - H_e) * Lambda_e_p_b + (1 - H_r) * Lambda_e_r_b + (1 - H_q) * y_q * sigma,
         )
 
         return all(real_time_balances) and retry_balance and elastic_balance and primary_elastic_balance
@@ -638,12 +649,14 @@ def main():
         real_time_mus=[1, 1],
         real_time_resources=[4, 8],
         data_resources_min=2,
-        data_resources_max=3,
+        data_resources_max=100,
         data_lambda=10,
         data_mu=2,
         queue_intensity=1,
         retry_intensity=1,
-        retry_probability=0.8,
+        retry_primary_prob=0.8,
+        retry_retry_prob=0.3,
+        retry_freeze_prob=0.5,
         beam_capacity=80,
         data_batch_probs=[0.2, 0.2, 0.1, 0.1, 0.2, 0.2],
     )

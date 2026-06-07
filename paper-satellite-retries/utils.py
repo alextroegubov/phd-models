@@ -30,8 +30,12 @@ class ParametersSet(BaseModel):
     queue_intensity: float = Field(ge=0, description="Queue intensity")
     # nu
     retry_intensity: float = Field(ge=0, description="Retry intensity")
-    # H
-    retry_probability: float = Field(ge=0, le=1, description="Retry probability")
+    # H_e
+    retry_primary_prob: float = Field(ge=0, le=1, description="Retry probability for rejected primary requests")
+    # H_r
+    retry_retry_prob: float = Field(ge=0, le=1, description="Retry probability for rejected retry requests")
+    # H_q
+    retry_freeze_prob: float = Field(ge=0, le=1, description="Retry probability for freeze requests")
 
     # v
     beam_capacity: int = Field(ge=1, description="Beam capacity")
@@ -84,11 +88,14 @@ class ParametersSet(BaseModel):
             f"  {real_time_params}\n"
             f"  Elastic Data Flow\n"
             f"    b_min = {self.data_resources_min}\n"
+            f"    b_max = {self.data_resources_max}\n"
             f"    λ_e = {self.data_lambda:.5f}\n"
             f"    μ_e = {self.data_mu:.5f}\n"
             f"    σ = {self.queue_intensity:.5f}\n"
             f"    ν = {self.retry_intensity:.5f}\n"
-            f"    H = {self.retry_probability:.5f}\n"
+            f"    H_e = {self.retry_primary_prob:.5f}\n"
+            f"    H_r = {self.retry_retry_prob:.5f}\n"
+            f"    H_q = {self.retry_freeze_prob:.5f}\n"
             f"    f_s = [{f_lst_4f(self.data_batch_probs)}]\n"
         )
 
