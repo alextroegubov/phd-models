@@ -111,6 +111,7 @@ class Solver:
         lambda_e = self.params.data_lambda
         mu_e = self.params.data_mu
         b_min = self.params.data_resources_min
+        b_max = self.params.data_resources_max
 
         v = self.params.beam_capacity
         sigma = self.params.queue_intensity
@@ -150,7 +151,7 @@ class Solver:
             data_arr_reject_d = lambda_e * at_least_one_retry_prob * (l + d * b_min + b_min > v)
 
             # serve ET request
-            data_serv_d = mu_e * (v - l) * (d - q > 0)
+            data_serv_d = (mu_e / b_min) * min(v - l, (d - q) * b_max)
             # go to retries or leaves the system from freeze queue
             freeze_d = q * sigma * (q > 0)
 
@@ -181,6 +182,7 @@ class Solver:
         lambda_e = self.params.data_lambda
         mu_e = self.params.data_mu
         b_min = self.params.data_resources_min
+        b_max = self.params.data_resources_max
         batch_probs = self.params.data_batch_probs
         batch_sizes = list(range(1, len(batch_probs) + 1))
 
@@ -242,7 +244,7 @@ class Solver:
 
             batch_offsets[idx + 1] = len(batch_src_indices)
 
-            self.data_serv_n_coef[idx] = mu_e * (v - l) * (d + 1 - q_prime > 0)
+            self.data_serv_n_coef[idx] = (mu_e / b_min) * min(v - l, (d + 1 - q_prime) * b_max)
 
             self.freeze_n_coef[idx] = q_prime * sigma * H * (q_prime > 0 and r > 0)
             self.freeze_out_n_coef[idx] = q_prime * sigma * (1 - H) * (q_prime > 0)
@@ -377,6 +379,7 @@ class Solver:
         nu = self.params.retry_intensity
         sigma = self.params.queue_intensity
         b_min = self.params.data_resources_min
+        b_max = self.params.data_resources_max
         H = self.params.retry_probability
         mu_e = self.params.data_mu
         batch_probs = self.params.data_batch_probs
@@ -396,7 +399,7 @@ class Solver:
         y_d = np.sum(self.p * d_arr)
 
         y_e = np.sum(self.p * (d_arr - self.q_arr))
-        m_e = np.sum(self.p * (v - self.l_arr) * (d_arr - self.q_arr > 0))
+        m_e = np.sum(self.p * np.minimum(v - self.l_arr, (d_arr - self.q_arr) * b_max))
         b_e = m_e / y_e
 
         mean_batch_size = float(np.sum(batch_probs * batch_sizes))
@@ -431,7 +434,7 @@ class Solver:
         pi_e_a = Lambda_e_b / Lambda_e
         pi_e_r = (1.0 - H) * (Lambda_e_b + y_q * sigma) / Lambda_e_p
 
-        W_sess = y_d / (m_e * mu_e + y_q * sigma)
+        W_sess = y_d / (m_e * mu_e / b_min + y_q * sigma)
 
         A = Lambda_e / Lambda_e_p
 
@@ -485,6 +488,7 @@ class Solver:
         mu_e = self.params.data_mu
         sigma = self.params.queue_intensity
         H = self.params.retry_probability
+        b_min = self.params.data_resources_min
 
         y_q = metrics.y_q
         m_e = metrics.m_e
@@ -516,19 +520,19 @@ class Solver:
         )
 
         # Total elastic flow balance:
-        # Lambda_e = Lambda_e_b + y_q * sigma + m_e * mu_e
+        # Lambda_e = Lambda_e_b + y_q * sigma + m_e * mu_e / b_min
         elastic_balance = self.check_balance(
             name="Elastic flow",
             lhs=Lambda_e,
-            rhs=Lambda_e_b + y_q * sigma + m_e * mu_e,
+            rhs=Lambda_e_b + y_q * sigma + m_e * mu_e / b_min,
         )
 
         # Primary elastic flow balance:
-        # Lambda_e_p = m_e * mu_e + (1 - H) * (Lambda_e_b + y_q * sigma)
+        # Lambda_e_p = m_e * mu_e / b_min + (1 - H) * (Lambda_e_b + y_q * sigma)
         primary_elastic_balance = self.check_balance(
             name="Primary elastic flow",
             lhs=Lambda_e_p,
-            rhs=m_e * mu_e + (1.0 - H) * (Lambda_e_b + y_q * sigma),
+            rhs=m_e * mu_e / b_min + (1.0 - H) * (Lambda_e_b + y_q * sigma),
         )
 
         return all(real_time_balances) and retry_balance and elastic_balance and primary_elastic_balance
@@ -634,9 +638,9 @@ def main():
         real_time_mus=[1, 1],
         real_time_resources=[4, 8],
         data_resources_min=2,
-        data_resources_max=100,
+        data_resources_max=3,
         data_lambda=10,
-        data_mu=1,
+        data_mu=2,
         queue_intensity=1,
         retry_intensity=1,
         retry_probability=0.8,
